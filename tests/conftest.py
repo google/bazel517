@@ -71,7 +71,7 @@ def _write_fake_bazel(
         *extra_input_lines,
     ]
 
-    script = f"""#!/usr/bin/env python3
+    script = f"""#!{sys.executable}
 import json
 import os
 import pathlib

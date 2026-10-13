@@ -51,7 +51,7 @@ class BazelConfig:
     """Configuration from [tool.bazel517] merged with PEP 517 config_settings."""
 
     target: str
-    bazel_bin: str = "bazel"
+    bazel_bin: str | None = None
     bazel_args: tuple[str, ...] = ()
     editable_bazel_args: tuple[str, ...] = ()
     env: Mapping[str, str] = dataclasses.field(default_factory=lambda: _EMPTY_STR_MAP)
@@ -258,11 +258,12 @@ def _parse_bazel_config(
             "in [tool.bazel517] or pass `-C target=//...`."
         )
 
-    bazel_bin = str(
+    raw_bazel_bin = (
         cs.get("bazel-bin")
         or os.environ.get("BAZEL_BIN")
-        or tool_table.get("bazel-bin", "bazel")
+        or tool_table.get("bazel-bin")
     )
+    bazel_bin = str(raw_bazel_bin) if raw_bazel_bin else None
 
     template_vars = python_template_vars()
     base_args = tuple(

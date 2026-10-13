@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import hashlib
 import json
 import pathlib
+import platform
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -334,3 +337,113 @@ def test_bazel_error_conditions(
     fake_bazel_factory(tmp_path, project_dir, **setup_kwargs)
     with pytest.raises(bazel517.BazelError, match=expected_match):
         bazel517.build_editable(str(tmp_path / "out"))
+
+
+def test_bazel_bin_path_resolution_and_bazelisk_fallback_download(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_bazel_factory: Callable[..., pathlib.Path],
+) -> None:
+    proj = tmp_path / "proj_dl"
+    pkg = proj / "src" / "mypkg"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("X = 1\n", encoding="utf-8")
+    (proj / "pyproject.toml").write_text(
+        """
+[build-system]
+requires = ["bazel517"]
+build-backend = "bazel517"
+
+[tool.bazel517]
+target = "//ci/wheel:mypkg_wheel"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(proj)
+    monkeypatch.delenv("BAZEL_BIN", raising=False)
+
+    fake_script = fake_bazel_factory(tmp_path, proj)
+    log_file = tmp_path / "bazel_invocations.jsonl"
+
+    # 1. When both `bazelisk` and `bazel` are on PATH, `bazelisk` is preferred.
+    path_dir = tmp_path / "bin_on_path"
+    path_dir.mkdir()
+    exe_suffix = ".exe" if sys.platform == "win32" else ""
+    shutil.copy2(fake_script, path_dir / f"bazelisk{exe_suffix}")
+    shutil.copy2(fake_script, path_dir / f"bazel{exe_suffix}")
+    monkeypatch.setenv("PATH", str(path_dir))
+
+    whl1 = bazel517.build_wheel(str(tmp_path / "w1"))
+    assert (tmp_path / "w1" / whl1).is_file()
+
+    # 2. When only `bazel` is on PATH, `bazel` is used.
+    (path_dir / f"bazelisk{exe_suffix}").unlink()
+    whl2 = bazel517.build_wheel(str(tmp_path / "w2"))
+    assert (tmp_path / "w2" / whl2).is_file()
+
+    # 3. When neither is on PATH, bazelisk is downloaded, verified, and cached.
+    empty_path = tmp_path / "empty_path"
+    empty_path.mkdir()
+    monkeypatch.setenv("PATH", str(empty_path))
+
+    mirror_dir = tmp_path / "mirror"
+    mirror_dir.mkdir()
+    asset_bytes = fake_script.read_bytes()
+    asset_sha256 = hashlib.sha256(asset_bytes).hexdigest()
+    for asset_name in (
+        "bazelisk-linux-amd64",
+        "bazelisk-linux-arm64",
+        "bazelisk-darwin-amd64",
+        "bazelisk-darwin-arm64",
+        "bazelisk-windows-amd64.exe",
+        "bazelisk-windows-arm64.exe",
+    ):
+        (mirror_dir / asset_name).write_bytes(asset_bytes)
+
+    monkeypatch.setenv("BAZEL517_BAZELISK_BASE_URL", mirror_dir.as_uri())
+    monkeypatch.setenv("BAZEL517_BAZELISK_SHA256", asset_sha256)
+
+    # Test cache directory resolution via BAZEL517_CACHE_DIR, XDG_CACHE_HOME, and HOME
+    cache_dir = tmp_path / "custom_cache"
+    monkeypatch.setenv("BAZEL517_CACHE_DIR", str(cache_dir))
+    whl3 = bazel517.build_wheel(str(tmp_path / "w3"))
+    assert (tmp_path / "w3" / whl3).is_file()
+
+    # Remove mirror files to prove the second invocation uses the cached binary
+    shutil.rmtree(mirror_dir)
+    whl4 = bazel517.build_wheel(str(tmp_path / "w4"))
+    assert (tmp_path / "w4" / whl4).is_file()
+
+    # Test XDG_CACHE_HOME and HOME cache dir branches + download failure
+    monkeypatch.delenv("BAZEL517_CACHE_DIR")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg_cache"))
+    with pytest.raises(bazel517.BazelError, match="Failed to download bazelisk"):
+        bazel517.build_wheel(str(tmp_path / "w_fail_dl"))
+
+    monkeypatch.delenv("XDG_CACHE_HOME")
+    monkeypatch.setenv("HOME", str(tmp_path / "fake_home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "fake_home"))
+    mirror_dir.mkdir()
+    for asset_name in (
+        "bazelisk-linux-amd64",
+        "bazelisk-linux-arm64",
+        "bazelisk-darwin-amd64",
+        "bazelisk-darwin-arm64",
+        "bazelisk-windows-amd64.exe",
+        "bazelisk-windows-arm64.exe",
+    ):
+        (mirror_dir / asset_name).write_bytes(asset_bytes)
+
+    # Test SHA-256 mismatch error
+    monkeypatch.setenv("BAZEL517_BAZELISK_SHA256", "0" * 64)
+    with pytest.raises(bazel517.BazelError, match="SHA-256 mismatch for bazelisk"):
+        bazel517.build_wheel(str(tmp_path / "w_fail_sha"))
+
+    # Test unsupported platform/architecture error
+    monkeypatch.setattr(platform, "machine", lambda: "unsupported_arch")
+    with pytest.raises(
+        bazel517.BazelError,
+        match="no prebuilt bazelisk binary is available",
+    ):
+        bazel517.build_wheel(str(tmp_path / "w_fail_arch"))
+    assert log_file.is_file()

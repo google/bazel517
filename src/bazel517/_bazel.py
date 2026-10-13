@@ -1,21 +1,77 @@
-"""Bazel wheel target building and source-layout discovery."""
+"""Bazel wheel target building, binary resolution, and source-layout discovery."""
 
 from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
 import dataclasses
+import hashlib
 import json
 import os
 import pathlib
+import platform
 import shlex
+import shutil
+import stat
 import subprocess
+import sys
 import tempfile
-from typing import Any
+import types
+from typing import Any, Final
 import urllib.parse
 import urllib.request
 
 from . import _config
+
+_BAZELISK_VERSION: Final[str] = "v1.29.0"
+_DEFAULT_BAZELISK_BASE_URL: Final[str] = (
+    f"https://github.com/bazelbuild/bazelisk/releases/download/{_BAZELISK_VERSION}"
+)
+_OS_ALIASES: Final[Mapping[str, str]] = types.MappingProxyType(
+    {
+        "linux": "linux",
+        "darwin": "darwin",
+        "win32": "windows",
+    }
+)
+_ARCH_ALIASES: Final[Mapping[str, str]] = types.MappingProxyType(
+    {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }
+)
+_BAZELISK_ASSETS: Final[Mapping[tuple[str, str], tuple[str, str]]] = (
+    types.MappingProxyType(
+        {
+            ("linux", "amd64"): (
+                "bazelisk-linux-amd64",
+                "5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992",
+            ),
+            ("linux", "arm64"): (
+                "bazelisk-linux-arm64",
+                "e20e8b0f4f240091b7a55bf17b9398bd4f40ee70ae0208dff95dd4c445fb4010",
+            ),
+            ("darwin", "amd64"): (
+                "bazelisk-darwin-amd64",
+                "16c3d7aa15323a9fb69f56c7ec5733ed18bedb786680d0ba13bb12a3c8083007",
+            ),
+            ("darwin", "arm64"): (
+                "bazelisk-darwin-arm64",
+                "cee851f726789227d5561004e9904a52be45c3efb56f8b38b6993d6adbaa0409",
+            ),
+            ("windows", "amd64"): (
+                "bazelisk-windows-amd64.exe",
+                "092a8738d5b41aae7a85c42cc961b1034e3389aba43ffc20c0fabda7b43e095b",
+            ),
+            ("windows", "arm64"): (
+                "bazelisk-windows-arm64.exe",
+                "8bc42bd5d7857f18a21440b906469bb6c7cf91a7c72364d4b1e5ec56a76fe94f",
+            ),
+        }
+    )
+)
 
 
 class BazelError(RuntimeError):
@@ -42,6 +98,75 @@ def _merged_env(extra_env: Mapping[str, str]) -> Mapping[str, str]:
     env = dict(os.environ)
     env.update(extra_env)
     return env
+
+
+def _bazelisk_cache_dir() -> pathlib.Path:
+    if custom := os.environ.get("BAZEL517_CACHE_DIR"):
+        return pathlib.Path(custom)
+    if xdg := os.environ.get("XDG_CACHE_HOME"):
+        return pathlib.Path(xdg) / "bazel517"
+    return pathlib.Path.home() / ".cache" / "bazel517"
+
+
+def _download_bazelisk() -> str:
+    os_key = _OS_ALIASES.get(sys.platform, "")
+    arch_key = _ARCH_ALIASES.get(platform.machine().lower(), "")
+    asset = _BAZELISK_ASSETS.get((os_key, arch_key))
+    if asset is None:
+        raise BazelError(
+            "Neither `bazelisk` nor `bazel` was found on PATH, and no prebuilt "
+            f"bazelisk binary is available for {sys.platform}/{platform.machine()}."
+        )
+    asset_name, default_sha256 = asset
+    expected_sha256 = os.environ.get("BAZEL517_BAZELISK_SHA256", default_sha256).lower()
+
+    dest_dir = _bazelisk_cache_dir() / f"bazelisk-{_BAZELISK_VERSION}"
+    dest_path = dest_dir / asset_name
+    if (
+        dest_path.is_file()
+        and hashlib.sha256(dest_path.read_bytes()).hexdigest() == expected_sha256
+    ):
+        return str(dest_path)
+
+    base_url = os.environ.get(
+        "BAZEL517_BAZELISK_BASE_URL", _DEFAULT_BAZELISK_BASE_URL
+    ).rstrip("/")
+    url = f"{base_url}/{asset_name}"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = resp.read()
+    except Exception as exc:
+        raise BazelError(f"Failed to download bazelisk from {url}: {exc}") from exc
+
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise BazelError(
+            f"SHA-256 mismatch for bazelisk downloaded from {url}: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=dest_dir, delete=False) as tmp_file:
+        tmp_file.write(data)
+        tmp_path = pathlib.Path(tmp_file.name)
+    tmp_path.chmod(tmp_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    tmp_path.replace(dest_path)
+    return str(dest_path)
+
+
+def _resolve_bazel_bin(configured_bin: str | None) -> str:
+    """Resolve the Bazel executable to invoke.
+
+    Uses an explicitly configured binary first; otherwise prefers `bazelisk`
+    over `bazel` on `PATH`, and falls back to downloading a pinned `bazelisk`
+    release binary verified by SHA-256.
+    """
+    if configured_bin is not None:
+        return configured_bin
+    found = shutil.which("bazelisk") or shutil.which("bazel")
+    if found is not None:
+        return found
+    return _download_bazelisk()
 
 
 def _path_from_bep_file_entry(
@@ -123,13 +248,14 @@ def build_bazel_wheel_target(
     expansions are captured directly from `bazel build` in a single invocation
     without running `bazel cquery`.
     """
+    bazel_bin = _resolve_bazel_bin(bazel_cfg.bazel_bin)
     flags = bazel_cfg.editable_bazel_args if editable else bazel_cfg.bazel_args
     env = _merged_env(bazel_cfg.env)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         bep_path = pathlib.Path(tmp_dir) / "bep.json"
         build_cmd = [
-            bazel_cfg.bazel_bin,
+            bazel_bin,
             "build",
             *flags,
             f"--build_event_json_file={bep_path}",
@@ -203,6 +329,7 @@ def query_wheel_source_layout(
     those already-expanded flags are passed instead of raw `--config` flags so
     `build:`-scoped `.bazelrc` definitions cannot diverge in `aquery`.
     """
+    bazel_bin = _resolve_bazel_bin(bazel_cfg.bazel_bin)
     if expanded_args is not None:
         flags: Sequence[str] = expanded_args
     else:
@@ -210,7 +337,7 @@ def query_wheel_source_layout(
     env = _merged_env(bazel_cfg.env)
 
     aquery_cmd = [
-        bazel_cfg.bazel_bin,
+        bazel_bin,
         "aquery",
         f'mnemonic("PyWheel", {bazel_cfg.target})',
         "--output=jsonproto",

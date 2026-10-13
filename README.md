@@ -54,6 +54,8 @@ BAZEL517_BAZEL_ARGS="--config=no_rbe" pip install .
 
 ## How it works
 
+When resolving the Bazel executable, `bazel517` uses an explicit `bazel-bin` setting (from `-C bazel-bin=...`, `BAZEL_BIN`, or `[tool.bazel517].bazel-bin`) if one is provided. Otherwise it looks for `bazelisk` and then `bazel` on `PATH`, and if neither is installed it downloads and caches a `bazelisk` binary (verified by SHA-256) in `~/.cache/bazel517`.
+
 For a standard wheel build (`build_wheel`), `bazel517` runs `bazel build` on the configured target with `--build_event_json_file`, reads the resulting `.whl` path from the Build Event Protocol output, and copies the wheel into the directory requested by the frontend.
 
 For an editable install (`build_editable`), `bazel517` builds the wheel target and then runs `bazel aquery` against the `PyWheel` action (using the canonicalized flags from the build event stream) to inspect the `--strip_path_prefix` and `--input_file_list` arguments passed to `rules_python`'s wheelmaker. From those inputs, it determines which files in the wheel came from workspace `.py` / `.pyi` sources rather than generated or compiled outputs in `bazel-out/`. It strips the workspace Python sources from the wheel while leaving compiled extensions (such as `.so` files) and generated modules intact, and adds a `.pth` file and `MetaPathFinder` hook that merges the workspace source directories with the installed `site-packages` package directories on `__path__`.
