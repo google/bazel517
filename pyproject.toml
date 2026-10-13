@@ -5,7 +5,7 @@ build-backend = "flit_core.buildapi"
 [project]
 name = "bazel517"
 version = "0.1.0"
-description = "A modern, setuptools-free PEP 517 / PEP 660 Python build backend wrapping Bazel."
+description = "A PEP 517 / PEP 660 Python build backend that wraps a Bazel wheel target."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
