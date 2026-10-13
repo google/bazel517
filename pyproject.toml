@@ -27,7 +27,9 @@ classifiers = [
     "Topic :: Software Development :: Build Tools",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    "packaging>=24",
+]
 
 [dependency-groups]
 test = [

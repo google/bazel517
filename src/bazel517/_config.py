@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import dataclasses
 import os
 import pathlib
@@ -14,9 +14,18 @@ import tomllib
 import types
 from typing import Any, Final
 
+import packaging.version
+
 _CANONICALIZE_RE: Final[re.Pattern[str]] = re.compile(r"[-_.]+")
 _EMPTY_STR_MAP: Final[Mapping[str, str]] = types.MappingProxyType({})
 _EMPTY_OPT_DEPS: Final[Mapping[str, tuple[str, ...]]] = types.MappingProxyType({})
+_README_CONTENT_TYPES: Final[Mapping[str, str]] = types.MappingProxyType(
+    {
+        ".md": "text/markdown",
+        ".rst": "text/x-rst",
+        ".txt": "text/plain",
+    }
+)
 
 
 def distribution_filename_component(name: str) -> str:
@@ -25,8 +34,16 @@ def distribution_filename_component(name: str) -> str:
 
 
 def version_filename_component(version: str) -> str:
-    """Normalize a version component for wheel and sdist filenames."""
-    return version.strip().replace("-", "_")
+    """Normalize a version component according to PEP 440 / PEP 625."""
+    return str(packaging.version.Version(version.strip()))
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Readme:
+    """Parsed README text and MIME content-type."""
+
+    text: str
+    content_type: str
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -47,8 +64,7 @@ class ProjectMetadata:
     name: str
     version: str
     description: str = ""
-    readme_text: str | None = None
-    readme_content_type: str | None = None
+    readme: Readme | None = None
     requires_python: str | None = None
     license_expression: str | None = None
     license_text: str | None = None
@@ -100,7 +116,7 @@ def interpolate_arg(arg: str, variables: Mapping[str, str]) -> str:
 def _extract_config_setting_list(
     config_settings: Mapping[str, Any] | None,
     *keys: str,
-) -> tuple[str, ...]:
+) -> Sequence[str]:
     if not config_settings:
         return ()
     result: list[str] = []
@@ -116,29 +132,41 @@ def _extract_config_setting_list(
     return tuple(result)
 
 
+def _infer_readme_content_type(readme_path: pathlib.Path) -> str:
+    return _README_CONTENT_TYPES.get(readme_path.suffix.lower(), "text/plain")
+
+
 def _parse_readme(
     project_root: pathlib.Path,
     raw_readme: str | Mapping[str, Any] | None,
-) -> tuple[str | None, str | None]:
+) -> Readme | None:
     if raw_readme is None:
-        return None, None
+        return None
     if isinstance(raw_readme, str):
         readme_path = project_root / raw_readme
-        text = readme_path.read_text(encoding="utf-8")
-        suffix = readme_path.suffix.lower()
-        content_type = {
-            ".md": "text/markdown",
-            ".rst": "text/x-rst",
-            ".txt": "text/plain",
-        }.get(suffix, "text/plain")
-        return text, content_type
+        return Readme(
+            text=readme_path.read_text(encoding="utf-8"),
+            content_type=_infer_readme_content_type(readme_path),
+        )
     if isinstance(raw_readme, Mapping):
-        content_type = str(raw_readme.get("content-type", "text/plain"))
+        explicit_ct = raw_readme.get("content-type")
         if "file" in raw_readme:
             readme_path = project_root / str(raw_readme["file"])
-            return readme_path.read_text(encoding="utf-8"), content_type
+            content_type = (
+                str(explicit_ct)
+                if explicit_ct is not None
+                else _infer_readme_content_type(readme_path)
+            )
+            return Readme(
+                text=readme_path.read_text(encoding="utf-8"),
+                content_type=content_type,
+            )
         if "text" in raw_readme:
-            return str(raw_readme["text"]), content_type
+            content_type = str(explicit_ct) if explicit_ct is not None else "text/plain"
+            return Readme(
+                text=str(raw_readme["text"]),
+                content_type=content_type,
+            )
     raise ValueError(f"Unsupported [project].readme value: {raw_readme!r}")
 
 
@@ -151,10 +179,8 @@ def _parse_project_metadata(
     if "version" not in project_table:
         raise ValueError("Missing required [project].version in pyproject.toml")
 
-    readme_text, readme_content_type = _parse_readme(
-        project_root,
-        project_table.get("readme"),
-    )
+    normalized_version = version_filename_component(str(project_table["version"]))
+    readme = _parse_readme(project_root, project_table.get("readme"))
 
     license_expr: str | None = None
     license_text: str | None = None
@@ -179,10 +205,9 @@ def _parse_project_metadata(
 
     return ProjectMetadata(
         name=str(project_table["name"]),
-        version=str(project_table["version"]),
+        version=normalized_version,
         description=str(project_table.get("description", "")),
-        readme_text=readme_text,
-        readme_content_type=readme_content_type,
+        readme=readme,
         requires_python=(
             str(project_table["requires-python"])
             if "requires-python" in project_table

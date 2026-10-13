@@ -15,7 +15,7 @@ def _format_people(
     entries: Sequence[Mapping[str, str]],
     name_header: str,
     email_header: str,
-) -> tuple[str, ...]:
+) -> Sequence[str]:
     names: list[str] = []
     emails: list[str] = []
     for person in entries:
@@ -52,8 +52,8 @@ def format_core_metadata(metadata: _config.ProjectMetadata) -> str:
     if metadata.license_expression:
         lines.append(f"License-Expression: {metadata.license_expression}")
     elif metadata.license_text:
-        single_line = " ".join(metadata.license_text.splitlines()).strip()
-        lines.append(f"License: {single_line}")
+        folded = "\n        ".join(metadata.license_text.strip().splitlines())
+        lines.append(f"License: {folded}")
 
     for lic_file in metadata.license_files:
         lines.append(f"License-File: {lic_file}")
@@ -70,8 +70,8 @@ def format_core_metadata(metadata: _config.ProjectMetadata) -> str:
     if metadata.requires_python:
         lines.append(f"Requires-Python: {metadata.requires_python}")
 
-    if metadata.readme_content_type:
-        lines.append(f"Description-Content-Type: {metadata.readme_content_type}")
+    if metadata.readme is not None:
+        lines.append(f"Description-Content-Type: {metadata.readme.content_type}")
 
     for dep in metadata.dependencies:
         lines.append(f"Requires-Dist: {dep}")
@@ -89,8 +89,8 @@ def format_core_metadata(metadata: _config.ProjectMetadata) -> str:
                 lines.append(f'Requires-Dist: {dep}; extra == "{extra}"')
 
     header_block = "\n".join(lines) + "\n"
-    if metadata.readme_text is not None:
-        return f"{header_block}\n{metadata.readme_text.rstrip()}\n"
+    if metadata.readme is not None:
+        return f"{header_block}\n{metadata.readme.text.rstrip()}\n"
     return header_block
 
 
@@ -108,7 +108,6 @@ def format_record(
     """Format a `.dist-info/RECORD` file according to PEP 376 / PEP 427."""
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=",", quotechar='"', lineterminator="\n")
-    for path, digest, size in entries:
-        writer.writerow([path, digest, str(size)])
+    writer.writerows((path, digest, str(size)) for path, digest, size in entries)
     writer.writerow([record_path, "", ""])
     return buf.getvalue()
