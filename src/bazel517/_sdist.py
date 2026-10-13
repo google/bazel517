@@ -32,7 +32,7 @@ _EXCLUDED_DIRS: Final[frozenset[str]] = frozenset(
 
 def _git_tracked_files(
     project_root: pathlib.Path,
-) -> tuple[pathlib.Path, ...] | None:
+) -> Sequence[pathlib.Path] | None:
     if not (project_root / ".git").exists():
         return None
     try:
@@ -42,7 +42,7 @@ def _git_tracked_files(
             capture_output=True,
             check=True,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except FileNotFoundError:
         return None
 
     files: list[pathlib.Path] = []
