@@ -81,12 +81,19 @@ class ProjectMetadata:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class BuildConfig:
-    """Complete build configuration for a project."""
+class WheelBuildConfig:
+    """Configuration required to build standard and editable wheels via Bazel."""
+
+    project_root: pathlib.Path
+    bazel: BazelConfig
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SdistBuildConfig:
+    """Configuration required to build a PEP 625 source distribution."""
 
     project_root: pathlib.Path
     metadata: ProjectMetadata
-    bazel: BazelConfig
 
 
 def python_template_vars() -> Mapping[str, str]:
@@ -295,27 +302,43 @@ def _parse_bazel_config(
     )
 
 
-def load_build_config(
-    project_root: pathlib.Path | None = None,
-    config_settings: Mapping[str, Any] | None = None,
-) -> BuildConfig:
-    """Load and validate pyproject.toml from project_root."""
+def _read_pyproject_toml(
+    project_root: pathlib.Path | None,
+) -> tuple[pathlib.Path, Mapping[str, Any]]:
     root = (project_root or pathlib.Path.cwd()).resolve()
     pyproject_path = root / "pyproject.toml"
     if not pyproject_path.is_file():
         raise FileNotFoundError(f"pyproject.toml not found in {root}")
-
     with pyproject_path.open("rb") as f:
         data = tomllib.load(f)
+    return root, data
 
-    project_table = data.get("project")
-    if not isinstance(project_table, Mapping):
-        raise ValueError("Missing [project] table in pyproject.toml")
 
+def load_wheel_config(
+    project_root: pathlib.Path | None = None,
+    config_settings: Mapping[str, Any] | None = None,
+) -> WheelBuildConfig:
+    """Load `[tool.bazel517]` configuration for building wheels.
+
+    Does not require static `[project].name` or `[project].version` fields in
+    `pyproject.toml`, allowing projects whose version is stamped dynamically by
+    Bazel to build standard and editable wheels.
+    """
+    root, data = _read_pyproject_toml(project_root)
     tool_table = data.get("tool", {}).get("bazel517", {})
     if not isinstance(tool_table, Mapping):
         raise ValueError("[tool.bazel517] must be a TOML table")
-
-    metadata = _parse_project_metadata(root, project_table)
     bazel_cfg = _parse_bazel_config(tool_table, config_settings)
-    return BuildConfig(project_root=root, metadata=metadata, bazel=bazel_cfg)
+    return WheelBuildConfig(project_root=root, bazel=bazel_cfg)
+
+
+def load_sdist_config(
+    project_root: pathlib.Path | None = None,
+) -> SdistBuildConfig:
+    """Load `[project]` metadata from `pyproject.toml` for building an sdist."""
+    root, data = _read_pyproject_toml(project_root)
+    project_table = data.get("project")
+    if not isinstance(project_table, Mapping):
+        raise ValueError("Missing [project] table in pyproject.toml")
+    metadata = _parse_project_metadata(root, project_table)
+    return SdistBuildConfig(project_root=root, metadata=metadata)

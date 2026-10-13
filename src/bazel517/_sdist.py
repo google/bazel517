@@ -74,7 +74,7 @@ def _fallback_walk_files(
 
 
 def build_source_distribution(
-    cfg: _config.BuildConfig,
+    cfg: _config.SdistBuildConfig,
     sdist_dir: pathlib.Path,
 ) -> str:
     """Build a PEP 625 `.tar.gz` source distribution in `sdist_dir`."""
