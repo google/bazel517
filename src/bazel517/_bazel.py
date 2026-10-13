@@ -8,13 +8,26 @@ import dataclasses
 import json
 import os
 import pathlib
+import shlex
 import subprocess
+import tempfile
+from typing import Any
+import urllib.parse
+import urllib.request
 
 from . import _config
 
 
 class BazelError(RuntimeError):
     """Raised when a Bazel command fails or produces unexpected output."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class WheelBuildResult:
+    """Output wheel path and canonicalized build flags from `bazel build`."""
+
+    wheel_path: pathlib.Path
+    expanded_args: tuple[str, ...] | None = None
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -25,10 +38,76 @@ class WheelSourceLayout:
     pth_dirs: tuple[pathlib.Path, ...]
 
 
-def _merged_env(extra_env: Mapping[str, str]) -> dict[str, str]:
+def _merged_env(extra_env: Mapping[str, str]) -> Mapping[str, str]:
     env = dict(os.environ)
     env.update(extra_env)
     return env
+
+
+def _path_from_bep_file_entry(
+    project_root: pathlib.Path,
+    file_entry: Mapping[str, Any],
+) -> pathlib.Path | None:
+    uri = file_entry.get("uri")
+    if isinstance(uri, str) and uri.startswith("file://"):
+        parsed = urllib.parse.urlparse(uri)
+        return pathlib.Path(urllib.request.url2pathname(parsed.path))
+    name = file_entry.get("name")
+    if isinstance(name, str) and name:
+        prefix = [str(p) for p in file_entry.get("pathPrefix", ())]
+        candidate = pathlib.Path(*prefix, name)
+        if not candidate.is_absolute():
+            candidate = project_root / candidate
+        return candidate
+    return None
+
+
+def _parse_bep_events(
+    project_root: pathlib.Path,
+    bep_path: pathlib.Path,
+) -> tuple[Sequence[pathlib.Path], tuple[str, ...] | None]:
+    whl_paths: list[pathlib.Path] = []
+    expanded_args: tuple[str, ...] | None = None
+
+    for raw_line in bep_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        event = json.loads(line)
+
+        for file_entry in event.get("namedSetOfFiles", {}).get("files", ()):
+            candidate = _path_from_bep_file_entry(project_root, file_entry)
+            if (
+                candidate is not None
+                and candidate.suffix == ".whl"
+                and candidate not in whl_paths
+            ):
+                whl_paths.append(candidate)
+
+        cmd_label = (
+            event.get("id", {}).get("structuredCommandLine", {}).get("commandLineLabel")
+        )
+        if cmd_label == "canonical":
+            expanded: list[str] = []
+            for section in event.get("structuredCommandLine", {}).get("sections", ()):
+                if section.get("sectionLabel") != "command options":
+                    continue
+                for opt in section.get("optionList", {}).get("option", ()):
+                    tags = set(opt.get("metadataTags", ()))
+                    if "HIDDEN" in tags or "NON_CONFIGURABLE" in tags:
+                        continue
+                    if opt.get("optionName") in {"config", "build_event_json_file"}:
+                        continue
+                    source = str(opt.get("source", ""))
+                    if (
+                        not source
+                        or source == "command line options"
+                        or source.startswith("expanded from --config=")
+                    ):
+                        expanded.extend(shlex.split(str(opt.get("combinedForm", ""))))
+            expanded_args = tuple(expanded)
+
+    return tuple(whl_paths), expanded_args
 
 
 def build_bazel_wheel_target(
@@ -36,47 +115,33 @@ def build_bazel_wheel_target(
     bazel_cfg: _config.BazelConfig,
     *,
     editable: bool = False,
-) -> pathlib.Path:
-    """Build `bazel_cfg.target` and return the path to the generated `.whl` file."""
+) -> WheelBuildResult:
+    """Build `bazel_cfg.target` and return the `.whl` path and expanded build flags.
+
+    Uses `--build_event_json_file` (Build Event Protocol) on `bazel build` so
+    that the `.whl` output path and any `build:`-scoped `.bazelrc` `--config`
+    expansions are captured directly from `bazel build` in a single invocation
+    without running `bazel cquery`.
+    """
     flags = bazel_cfg.editable_bazel_args if editable else bazel_cfg.bazel_args
     env = _merged_env(bazel_cfg.env)
 
-    build_cmd = [bazel_cfg.bazel_bin, "build", *flags, bazel_cfg.target]
-    subprocess.run(
-        build_cmd,
-        cwd=project_root,
-        env=env,
-        check=True,
-    )
-
-    cquery_cmd = [
-        bazel_cfg.bazel_bin,
-        "cquery",
-        "--output=files",
-        "--ui_event_filters=-info,-stderr",
-        "--noshow_progress",
-        *flags,
-        bazel_cfg.target,
-    ]
-    proc = subprocess.run(
-        cquery_cmd,
-        cwd=project_root,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    whl_paths: list[pathlib.Path] = []
-    for raw_line in proc.stdout.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        candidate = pathlib.Path(line)
-        if not candidate.is_absolute():
-            candidate = project_root / candidate
-        if candidate.suffix == ".whl":
-            whl_paths.append(candidate)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        bep_path = pathlib.Path(tmp_dir) / "bep.json"
+        build_cmd = [
+            bazel_cfg.bazel_bin,
+            "build",
+            *flags,
+            f"--build_event_json_file={bep_path}",
+            bazel_cfg.target,
+        ]
+        subprocess.run(
+            build_cmd,
+            cwd=project_root,
+            env=env,
+            check=True,
+        )
+        whl_paths, expanded_args = _parse_bep_events(project_root, bep_path)
 
     if len(whl_paths) != 1:
         raise BazelError(
@@ -88,7 +153,10 @@ def build_bazel_wheel_target(
             f"Bazel reported wheel output at {whl_paths[0]}, "
             "but the file does not exist."
         )
-    return whl_paths[0]
+    return WheelBuildResult(
+        wheel_path=whl_paths[0],
+        expanded_args=expanded_args,
+    )
 
 
 def _arcname_from(
@@ -105,7 +173,7 @@ def _arcname_from(
 
 def _parse_pywheel_action_args(
     arguments: Sequence[str],
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+) -> tuple[Sequence[str], Sequence[str], Sequence[str]]:
     """Extract strip prefixes and input file specs from `wheelmaker.py` argv."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--strip_path_prefix", action="append", default=[])
@@ -124,14 +192,21 @@ def query_wheel_source_layout(
     bazel_cfg: _config.BazelConfig,
     *,
     editable: bool = True,
+    expanded_args: Sequence[str] | None = None,
 ) -> WheelSourceLayout:
     """Query Bazel's `PyWheel` action for `bazel_cfg.target` to resolve source paths.
 
     Inspects the `PyWheel` action via `bazel aquery --output=jsonproto` to read
     `--strip_path_prefix`, `--input_file_list`, and `--input_file` directly from
-    Bazel without hardcoding any directory layout (such as `src/`).
+    Bazel without hardcoding any directory layout (such as `src/`). When
+    `expanded_args` is provided from `bazel build`'s Build Event Protocol output,
+    those already-expanded flags are passed instead of raw `--config` flags so
+    `build:`-scoped `.bazelrc` definitions cannot diverge in `aquery`.
     """
-    flags = bazel_cfg.editable_bazel_args if editable else bazel_cfg.bazel_args
+    if expanded_args is not None:
+        flags: Sequence[str] = expanded_args
+    else:
+        flags = bazel_cfg.editable_bazel_args if editable else bazel_cfg.bazel_args
     env = _merged_env(bazel_cfg.env)
 
     aquery_cmd = [

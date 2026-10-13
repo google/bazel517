@@ -6,9 +6,9 @@ A modern, `setuptools`-free Python build backend (PEP 517 / PEP 660) that wraps 
 
 ## How It Works
 
-1. **`build_wheel`**: Invokes `bazel build` on your configured Bazel wheel target (e.g. `//ci/wheel:torch_tpu_wheel`), queries the exact `.whl` output path via `bazel cquery --output=files`, copies the built `.whl` into the PEP 517 `wheel_directory`, and returns its filename.
-2. **`build_editable` (PEP 660)**: Builds the Bazel wheel target, queries the `PyWheel` action directly via `bazel aquery` (`--strip_path_prefix` and `--input_file_list`) to discover which wheel entries correspond to workspace source files and what their workspace root directories are, strips those `.py`/`.pyi` source files from the wheel while keeping all compiled artifacts (`.so`, generated headers, `.dist-info`), writes a `.pth` file with the discovered source roots, and updates `RECORD`.
-3. **`build_sdist`**: Builds a source distribution tarball (`.tar.gz`) with `PKG-INFO` from your repository sources.
+1. **`build_wheel`**: Invokes `bazel build` with `--build_event_json_file` on your configured Bazel wheel target (e.g. `//ci/wheel:torch_tpu_wheel`), extracts the exact `.whl` output path from the Build Event Protocol stream in a single Bazel invocation, copies the built `.whl` into the PEP 517 `wheel_directory`, and returns its filename.
+2. **`build_editable` (PEP 660)**: Builds the Bazel wheel target and queries the `PyWheel` action directly via `bazel aquery` (using the canonicalized build flags resolved by `bazel build`) to discover which wheel entries correspond to workspace source files and what their workspace root directories are. It strips those `.py`/`.pyi` workspace source files from the wheel while keeping all compiled artifacts (`.so`, generated files, `.dist-info`), writes a `.pth` file and `_editable_<pkg>.py` `MetaPathFinder` that merges workspace source directories with installed `site-packages` package directories on `__path__`, and updates `RECORD`.
+3. **`build_sdist`**: Builds a PEP 625 source distribution tarball (`.tar.gz`) with `PKG-INFO` from your repository sources.
 
 ## Usage in `pyproject.toml`
 
