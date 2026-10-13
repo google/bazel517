@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Testing & coverage
+.hypothesis/
+.nox/
+.tox/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Type checking & linting
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pyrefly/
+
+# Virtual environments
+.venv/
+venv/
+uv.lock
