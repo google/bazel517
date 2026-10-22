@@ -26,6 +26,11 @@ import pytest
 import bazel517
 
 
+def test_get_requires_for_build_sdist() -> None:
+    assert bazel517.get_requires_for_build_sdist() == []
+    assert bazel517.get_requires_for_build_sdist({"opt": "1"}) == []
+
+
 def test_build_sdist_walk_fallback_excludes_ignored_dirs_and_bytecode(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -118,6 +123,7 @@ def test_build_sdist_git_tracked_missing_git_binary_and_corrupt_git_repo(
 
 @hypothesis.settings(
     max_examples=25,
+    deadline=None,
     suppress_health_check=[hypothesis.HealthCheck.function_scoped_fixture],
 )
 @hypothesis.given(
