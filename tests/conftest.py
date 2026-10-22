@@ -37,6 +37,9 @@ class FakeBazelFactory(Protocol):
         aquery_actions: Sequence[Mapping[str, Any]] | None = None,
         write_inputs_txt: bool = True,
         extra_input_lines: Sequence[str] = (),
+        bazel_version: str = "8.6.0",
+        installed_versions: Sequence[str] | None = None,
+        log_dir: pathlib.Path | None = None,
     ) -> pathlib.Path: ...
 
 
@@ -51,8 +54,13 @@ def _write_fake_bazel(
     aquery_actions: Sequence[Mapping[str, Any]] | None = None,
     write_inputs_txt: bool = True,
     extra_input_lines: Sequence[str] = (),
+    bazel_version: str = "8.6.0",
+    installed_versions: Sequence[str] | None = None,
+    log_dir: pathlib.Path | None = None,
 ) -> pathlib.Path:
     """Create an executable script simulating `bazel build` (with BEP) and `aquery`."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    effective_log_dir = log_dir if log_dir is not None else bin_dir
     fake_bazel = bin_dir / "fake_bazel"
     wheel_bin_dir = workspace_dir / "bazel-out" / "k8-opt" / "bin" / "ci" / "wheel"
     out_whl = wheel_bin_dir / "mypkg-0.1.0-cp313-cp313-linux_x86_64.whl"
@@ -85,6 +93,10 @@ def _write_fake_bazel(
         *extra_input_lines,
     ]
 
+    installed_list = (
+        list(installed_versions) if installed_versions is not None else None
+    )
+
     script = f"""#!{sys.executable}
 import json
 import os
@@ -96,8 +108,75 @@ args = sys.argv[1:]
 cmd = args[0]
 out_whl = pathlib.Path({str(out_whl)!r})
 inputs_txt = pathlib.Path({str(inputs_txt)!r})
-log_file = pathlib.Path({str(bin_dir / "bazel_invocations.jsonl")!r})
+log_file = pathlib.Path({str(effective_log_dir / "bazel_invocations.jsonl")!r})
 custom_bep_lines = {list(bep_lines) if bep_lines is not None else None!r}
+default_version = {bazel_version!r}
+installed_versions = {installed_list!r}
+
+
+def _resolve_active_version() -> str:
+    if installed_versions is None:
+        return default_version
+    req = os.environ.get("USE_BAZEL_VERSION", "").strip()
+    if not req:
+        brc = pathlib.Path.cwd() / ".bazeliskrc"
+        if brc.is_file():
+            for raw in brc.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line.startswith("USE_BAZEL_VERSION="):
+                    req = line.partition("=")[2].strip()
+                    break
+    if not req:
+        bv = pathlib.Path.cwd() / ".bazelversion"
+        if bv.is_file():
+            for raw in bv.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line and not line.startswith("#"):
+                    req = line
+                    break
+    if not req or req == "latest":
+        return default_version
+    if "*" in installed_versions:
+        if req.endswith((".x", ".*")):
+            return req[:-2] + ".0"
+        return req
+    for cand in installed_versions:
+        cand_clean = cand.split("-", 1)[0]
+        if cand == req or cand_clean == req:
+            return cand
+        if req.endswith((".x", ".*")) and cand_clean.startswith(req[:-1]):
+            return cand
+    sys.stderr.write(f"ERROR: Bazel {{req}} not found in {{installed_versions}}\\n")
+    sys.exit(1)
+
+
+active_version = _resolve_active_version()
+
+if cmd == "--version":
+    if active_version == "fail":
+        sys.exit(1)
+    if active_version == "malformed":
+        print("unrecognized version output")
+        sys.exit(0)
+    print(f"bazel {{active_version}}")
+    sys.exit(0)
+
+bazelrc_flags = []
+bazelrc_path = pathlib.Path.cwd() / ".bazelrc"
+if bazelrc_path.is_file():
+    for raw in bazelrc_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            bazelrc_flags.append(line)
+            for token in line.split():
+                if token.startswith("--require_bazel_major="):
+                    req_major = token.partition("=")[2]
+                    if not active_version.startswith(req_major + "."):
+                        sys.stderr.write(
+                            f"ERROR: .bazelrc requires Bazel {{req_major}}.x, "
+                            f"got {{active_version}}\\n"
+                        )
+                        sys.exit(2)
 
 with log_file.open("a", encoding="utf-8") as lf:
     lf.write(
@@ -106,6 +185,8 @@ with log_file.open("a", encoding="utf-8") as lf:
                 "cmd": cmd,
                 "args": args,
                 "custom_env": os.environ.get("CUSTOM_BAZEL_VAR"),
+                "bazel_version": active_version,
+                "bazelrc_flags": bazelrc_flags,
             }}
         )
         + "\\n"
