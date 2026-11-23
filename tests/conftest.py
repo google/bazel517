@@ -37,6 +37,7 @@ class FakeBazelFactory(Protocol):
         aquery_actions: Sequence[Mapping[str, Any]] | None = None,
         write_inputs_txt: bool = True,
         extra_input_lines: Sequence[str] = (),
+        wheel_metadata: str | None = None,
     ) -> pathlib.Path: ...
 
 
@@ -51,12 +52,18 @@ def _write_fake_bazel(
     aquery_actions: Sequence[Mapping[str, Any]] | None = None,
     write_inputs_txt: bool = True,
     extra_input_lines: Sequence[str] = (),
+    wheel_metadata: str | None = None,
 ) -> pathlib.Path:
     """Create an executable script simulating `bazel build` (with BEP) and `aquery`."""
     fake_bazel = bin_dir / "fake_bazel"
     wheel_bin_dir = workspace_dir / "bazel-out" / "k8-opt" / "bin" / "ci" / "wheel"
     out_whl = wheel_bin_dir / "mypkg-0.1.0-cp313-cp313-linux_x86_64.whl"
     inputs_txt = wheel_bin_dir / "mypkg_wheel_target_wrapped_inputs.txt"
+    metadata = (
+        wheel_metadata
+        if wheel_metadata is not None
+        else "Metadata-Version: 2.4\nName: mypkg\nVersion: 0.1.0\n"
+    )
 
     default_actions: list[Mapping[str, Any]] = [
         {
@@ -134,7 +141,7 @@ if cmd == "build":
             zf.writestr("mypkg/_ext.pyd", b"MZ-fake-windows-pyd")
             zf.writestr(
                 "mypkg-0.1.0.dist-info/METADATA",
-                "Metadata-Version: 2.4\\nName: mypkg\\nVersion: 0.1.0\\n",
+                {metadata!r},
             )
             zf.writestr(
                 "mypkg-0.1.0.dist-info/WHEEL",
