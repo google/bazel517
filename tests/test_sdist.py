@@ -123,6 +123,8 @@ def test_build_sdist_git_tracked_missing_git_binary_and_corrupt_git_repo(
 
 @hypothesis.settings(
     max_examples=25,
+    # Each example creates directories and writes a `.tar.gz` archive on disk,
+    # which can exceed Hypothesis's 200ms default deadline on slower CI runners.
     deadline=None,
     suppress_health_check=[hypothesis.HealthCheck.function_scoped_fixture],
 )

@@ -19,25 +19,45 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 import contextlib
 import dataclasses
+import enum
 import json
 import os
 import pathlib
 import shutil
-import stat
 import subprocess
 import sys
+import textwrap
+from typing import Final
 import zipfile
 
 import pytest
 
 import bazel517
 from bazel517 import _bazel
+import conftest
 
-_BAZEL_VERSIONS: tuple[str, str] = ("7.4.1", "8.6.0")
+# Kept in sync with `.github/workflows/ci.yml` (`actions/cache` key); verified
+# by `test_ci_cache_matches_bazel_versions`.
+_BAZEL_VERSIONS: Final[tuple[str, str]] = ("7.4.1", "8.6.0")
+_REPO_ROOT: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parents[1]
+_BAZEL_WRAPPER_SCRIPT: Final[pathlib.Path] = (
+    pathlib.Path(__file__).resolve().parent / "data" / "bazel_wrapper.py"
+)
+
+
+class _VersionSource(enum.StrEnum):
+    BAZELVERSION = "bazelversion"
+    BAZELVERSION_FLOATING = "bazelversion_floating"
+    BAZELISKRC = "bazeliskrc"
+
+
+class _InstalledKind(enum.StrEnum):
+    STANDALONE = "standalone"
+    WRAPPER = "wrapper"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class RealBazelEnv:
+class _RealBazelEnv:
     """Paths and workspaces for real multi-version Bazel integration tests."""
 
     bazelisk_bin: pathlib.Path
@@ -109,113 +129,123 @@ def _write_bazel_workspace(workspace_dir: pathlib.Path) -> None:
     """Write a minimal real `rules_python` `py_wheel` workspace."""
     workspace_dir.mkdir(parents=True, exist_ok=True)
     (workspace_dir / "build_info.bzl").write_text(
-        """\
-def _bazel_version_repo_impl(rctx):
-    rctx.file("BUILD.bazel", "")
-    rctx.file("defs.bzl", "BAZEL_VERSION = %r\\n" % (native.bazel_version,))
+        textwrap.dedent(
+            """\
+            def _bazel_version_repo_impl(rctx):
+                rctx.file("BUILD.bazel", "")
+                rctx.file("defs.bzl", "BAZEL_VERSION = %r\\n" % (native.bazel_version,))
 
-bazel_version_repo = repository_rule(
-    implementation = _bazel_version_repo_impl,
-)
+            bazel_version_repo = repository_rule(
+                implementation = _bazel_version_repo_impl,
+            )
 
-def _ext_impl(mctx):
-    bazel_version_repo(name = "bazel_version_info")
+            def _ext_impl(_mctx):
+                bazel_version_repo(name = "bazel_version_info")
 
-bazel_version_ext = module_extension(implementation = _ext_impl)
+            bazel_version_ext = module_extension(implementation = _ext_impl)
 
-def _build_info_impl(ctx):
-    req_prefix = ctx.var.get("REQUIRED_BAZEL_PREFIX", "")
-    if req_prefix and not ctx.attr.bazel_version.startswith(req_prefix):
-        fail(
-            "Workspace .bazelrc requires Bazel %s*, but active Bazel is %s"
-            % (req_prefix, ctx.attr.bazel_version)
-        )
-    out = ctx.actions.declare_file(ctx.attr.out_name)
-    tag = ctx.var.get("BAZELRC_TAG", "unset")
-    ctx.actions.write(
-        output = out,
-        content = "BAZEL_VERSION = %r\\nBAZELRC_TAG = %r\\n"
-        % (ctx.attr.bazel_version, tag),
-    )
-    return [DefaultInfo(files = depset([out]))]
+            def _build_info_impl(ctx):
+                req_prefix = ctx.var.get("REQUIRED_BAZEL_PREFIX", "")
+                if req_prefix and not ctx.attr.bazel_version.startswith(req_prefix):
+                    fail(
+                        "Workspace .bazelrc requires Bazel %s*, but active Bazel is %s"
+                        % (req_prefix, ctx.attr.bazel_version)
+                    )
+                out = ctx.actions.declare_file(ctx.attr.out_name)
+                tag = ctx.var.get("BAZELRC_TAG", "unset")
+                ctx.actions.write(
+                    output = out,
+                    content = "BAZEL_VERSION = %r\\nBAZELRC_TAG = %r\\n"
+                    % (ctx.attr.bazel_version, tag),
+                )
+                return [DefaultInfo(files = depset([out]))]
 
-build_info = rule(
-    implementation = _build_info_impl,
-    attrs = {
-        "out_name": attr.string(mandatory = True),
-        "bazel_version": attr.string(mandatory = True),
-    },
-)
-""",
+            build_info = rule(
+                implementation = _build_info_impl,
+                attrs = {
+                    "out_name": attr.string(mandatory = True),
+                    "bazel_version": attr.string(mandatory = True),
+                },
+            )
+            """
+        ),
         encoding="utf-8",
     )
     (workspace_dir / "MODULE.bazel").write_text(
-        """\
-module(name = "sample_pkg", version = "0.1.0")
-bazel_dep(name = "rules_python", version = "1.2.0")
+        textwrap.dedent(
+            """\
+            module(name = "sample_pkg", version = "0.1.0")
+            bazel_dep(name = "rules_python", version = "1.2.0")
 
-bazel_version_ext = use_extension("//:build_info.bzl", "bazel_version_ext")
-use_repo(bazel_version_ext, "bazel_version_info")
-""",
+            bazel_version_ext = use_extension("//:build_info.bzl", "bazel_version_ext")
+            use_repo(bazel_version_ext, "bazel_version_info")
+            """
+        ),
         encoding="utf-8",
     )
     (workspace_dir / "BUILD.bazel").write_text(
-        """\
-load("@rules_python//python:packaging.bzl", "py_wheel")
-load("@rules_python//python:defs.bzl", "py_library")
-load("@bazel_version_info//:defs.bzl", "BAZEL_VERSION")
-load("//:build_info.bzl", "build_info")
+        textwrap.dedent(
+            """\
+            load("@rules_python//python:packaging.bzl", "py_wheel")
+            load("@rules_python//python:defs.bzl", "py_library")
+            load("@bazel_version_info//:defs.bzl", "BAZEL_VERSION")
+            load("//:build_info.bzl", "build_info")
 
-build_info(
-    name = "gen_build_info",
-    out_name = "src/sample_pkg/_build_info.py",
-    bazel_version = BAZEL_VERSION,
-)
+            build_info(
+                name = "gen_build_info",
+                out_name = "src/sample_pkg/_build_info.py",
+                bazel_version = BAZEL_VERSION,
+            )
 
-py_library(
-    name = "sample_lib",
-    srcs = [
-        "src/sample_pkg/__init__.py",
-        ":gen_build_info",
-    ],
-    imports = ["src"],
-)
+            py_library(
+                name = "sample_lib",
+                srcs = [
+                    "src/sample_pkg/__init__.py",
+                    ":gen_build_info",
+                ],
+                imports = ["src"],
+            )
 
-py_wheel(
-    name = "sample_wheel",
-    distribution = "sample_pkg",
-    python_tag = "py3",
-    strip_path_prefixes = ["src"],
-    version = "0.1.0",
-    deps = [":sample_lib"],
-)
-""",
+            py_wheel(
+                name = "sample_wheel",
+                distribution = "sample_pkg",
+                python_tag = "py3",
+                strip_path_prefixes = ["src"],
+                version = "0.1.0",
+                deps = [":sample_lib"],
+            )
+            """
+        ),
         encoding="utf-8",
     )
     pkg_dir = workspace_dir / "src" / "sample_pkg"
     pkg_dir.mkdir(parents=True, exist_ok=True)
     (pkg_dir / "__init__.py").write_text(
-        """\
-from ._build_info import BAZEL_VERSION, BAZELRC_TAG
+        textwrap.dedent(
+            """\
+            from ._build_info import BAZEL_VERSION, BAZELRC_TAG
 
-LIVE_VALUE = "initial"
-""",
+            LIVE_VALUE = "initial"
+            """
+        ),
         encoding="utf-8",
     )
     (workspace_dir / "pyproject.toml").write_text(
-        """\
-[build-system]
-requires = ["bazel517"]
-build-backend = "bazel517"
+        textwrap.dedent(
+            """\
+            [build-system]
+            requires = ["bazel517"]
+            build-backend = "bazel517"
 
-[project]
-name = "sample-pkg"
-version = "0.1.0"
+            [project]
+            name = "sample-pkg"
+            version = "0.1.0"
 
-[tool.bazel517]
-target = "//:sample_wheel"
-editable-bazel-args = ["--config=editable"]
-""",
+            [tool.bazel517]
+            target = "//:sample_wheel"
+            editable-bazel-args = ["--config=editable"]
+            """
+        ),
         encoding="utf-8",
     )
 
@@ -225,96 +255,26 @@ def _install_bazel_wrapper(
     installed_bins: Mapping[str, pathlib.Path],
     default_version: str,
 ) -> None:
-    """Install a multi-version `bazel` wrapper script into `bin_dir`."""
+    """Install a multi-version `bazel` wrapper executable into `bin_dir`."""
     bin_dir.mkdir(parents=True, exist_ok=True)
-    bins_dict = {ver: str(path) for ver, path in installed_bins.items()}
-    wrapper_code = f"""#!{sys.executable}
-import os
-import pathlib
-import subprocess
-import sys
-
-installed = {bins_dict!r}
-default_ver = {default_version!r}
-
-req = os.environ.get("USE_BAZEL_VERSION", "").strip()
-if not req:
-    cwd = pathlib.Path.cwd()
-    markers = ("MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel")
-    for d in (cwd, *cwd.parents):
-        if any((d / m).exists() for m in markers):
-            bv = d / ".bazelversion"
-            if bv.is_file():
-                for raw in bv.read_text(encoding="utf-8").splitlines():
-                    line = raw.strip()
-                    if line and not line.startswith("#"):
-                        req = line
-                        break
-            break
-
-if not req or req == "latest":
-    req = default_ver
-
-target = installed.get(req)
-if target is None:
-    sys.stderr.write(
-        f"ERROR: The project you're trying to build requires Bazel {{req}}, "
-        f"but only {{sorted(installed)}} are installed.\\n"
+    config_path = bin_dir / "_bazel_wrapper_config.json"
+    config_payload = {
+        "installed": {ver: str(path) for ver, path in installed_bins.items()},
+        "default_version": default_version,
+    }
+    config_path.write_text(json.dumps(config_payload), encoding="utf-8")
+    conftest.build_python_shim(
+        bin_dir=bin_dir,
+        name="bazel",
+        script_path=_BAZEL_WRAPPER_SCRIPT,
+        config_path=config_path,
     )
-    sys.exit(1)
-
-sys.exit(subprocess.call([target, *sys.argv[1:]]))
-"""
-    if sys.platform == "win32":
-        script_py = bin_dir / "_bazel_wrapper_impl.py"
-        script_py.write_text(wrapper_code, encoding="utf-8")
-        wrapper_exe = bin_dir / "bazel.exe"
-        cs_path = bin_dir / "_bazel_wrapper.cs"
-        py_escaped = sys.executable.replace("\\", "\\\\")
-        script_escaped = str(script_py).replace("\\", "\\\\")
-        cs_path.write_text(
-            "using System;\n"
-            "using System.Diagnostics;\n"
-            "class P {\n"
-            "    static int Main() {\n"
-            "        string cmd = Environment.CommandLine;\n"
-            "        int i = 0;\n"
-            '        if (cmd.StartsWith("\\"")) {\n'
-            "            i = cmd.IndexOf('\"', 1) + 1;\n"
-            "        } else {\n"
-            "            while (i < cmd.Length && !char.IsWhiteSpace(cmd[i]))\n"
-            "                i++;\n"
-            "        }\n"
-            "        string rest = cmd.Substring(i);\n"
-            f'        string py = "{py_escaped}";\n'
-            f'        string args = "\\"{script_escaped}\\"" + rest;\n'
-            "        var psi = new ProcessStartInfo(py, args) {\n"
-            "            UseShellExecute = false\n"
-            "        };\n"
-            "        var p = Process.Start(psi);\n"
-            "        p.WaitForExit();\n"
-            "        return p.ExitCode;\n"
-            "    }\n"
-            "}\n",
-            encoding="utf-8",
-        )
-        csc = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-        subprocess.run(
-            [csc, "/nologo", f"/out:{wrapper_exe}", str(cs_path)],
-            check=True,
-            capture_output=True,
-        )
-        return
-
-    wrapper_path = bin_dir / "bazel"
-    wrapper_path.write_text(wrapper_code, encoding="utf-8")
-    wrapper_path.chmod(wrapper_path.stat().st_mode | stat.S_IEXEC)
 
 
 @pytest.fixture(scope="session")
 def real_bazel_env(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[RealBazelEnv]:
+) -> Iterator[_RealBazelEnv]:
     root = tmp_path_factory.mktemp("real_bazel")
     bazelisk_bin = pathlib.Path(_bazel._download_bazelisk(os.environ))
     bazelisk_home = (
@@ -350,7 +310,7 @@ def real_bazel_env(
     clean_path = _build_clean_system_path(root / "clean_path")
 
     try:
-        yield RealBazelEnv(
+        yield _RealBazelEnv(
             bazelisk_bin=bazelisk_bin,
             bazelisk_home=bazelisk_home,
             bazel_bins=bazel_bins,
@@ -359,15 +319,16 @@ def real_bazel_env(
             clean_system_path=clean_path,
         )
     finally:
+        # Match `--output_user_root=C:/b` from `.bazelrc` on Windows (used to
+        # keep Bazel external repository paths under Windows `MAX_PATH`).
         startup_args = ["--output_user_root=C:/b"] if sys.platform == "win32" else []
         for ver, ws in workspaces.items():
-            if (ws / "MODULE.bazel").is_file():
-                subprocess.run(
-                    [str(bazel_bins[ver]), *startup_args, "shutdown"],
-                    cwd=ws,
-                    check=False,
-                    capture_output=True,
-                )
+            subprocess.run(
+                [str(bazel_bins[ver]), *startup_args, "shutdown"],
+                cwd=ws,
+                check=False,
+                capture_output=True,
+            )
 
 
 def _configure_workspace(
@@ -380,13 +341,14 @@ def _configure_workspace(
     bazelrc_tag: str,
 ) -> None:
     for rc_file in (ws / ".bazelversion", ws / ".bazeliskrc"):
-        if rc_file.exists():
-            rc_file.unlink()
+        rc_file.unlink(missing_ok=True)
     if bazelversion_text is not None:
         (ws / ".bazelversion").write_text(bazelversion_text, encoding="utf-8")
     if bazeliskrc_text is not None:
         (ws / ".bazeliskrc").write_text(bazeliskrc_text, encoding="utf-8")
 
+    # Use a short `output_user_root` on Windows so external repository paths
+    # under Bazel's execroot stay below the 260-character `MAX_PATH` limit.
     win_startup = "startup --output_user_root=C:/b\n" if sys.platform == "win32" else ""
     (ws / ".bazelrc").write_text(
         f"{win_startup}"
@@ -399,11 +361,13 @@ def _configure_workspace(
         encoding="utf-8",
     )
     (ws / "src" / "sample_pkg" / "__init__.py").write_text(
-        """\
-from ._build_info import BAZEL_VERSION, BAZELRC_TAG
+        textwrap.dedent(
+            """\
+            from ._build_info import BAZEL_VERSION, BAZELRC_TAG
 
-LIVE_VALUE = "initial"
-""",
+            LIVE_VALUE = "initial"
+            """
+        ),
         encoding="utf-8",
     )
 
@@ -417,21 +381,27 @@ def _verify_built_wheel(
 ) -> None:
     with zipfile.ZipFile(whl_path) as zf:
         zf.extractall(unpack_dir)
+    check_script = textwrap.dedent(
+        f"""\
+        import json
+        import site
+
+        site.addsitedir({str(unpack_dir)!r})
+        import sample_pkg
+
+        print(
+            json.dumps(
+                {{
+                    "bazel_version": sample_pkg.BAZEL_VERSION,
+                    "bazelrc_tag": sample_pkg.BAZELRC_TAG,
+                    "live_value": sample_pkg.LIVE_VALUE,
+                }}
+            )
+        )
+        """
+    )
     check = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            (
-                f"import json, site; site.addsitedir({str(unpack_dir)!r}); "
-                "import sample_pkg; "
-                "print(json.dumps({"
-                "'bazel_version': sample_pkg.BAZEL_VERSION, "
-                "'bazelrc_tag': sample_pkg.BAZELRC_TAG, "
-                "'live_value': sample_pkg.LIVE_VALUE"
-                "}))"
-            ),
-        ],
+        [sys.executable, "-I", "-c", check_script],
         check=True,
         capture_output=True,
         text=True,
@@ -440,6 +410,17 @@ def _verify_built_wheel(
     assert data["bazel_version"] == expected_bazel_version
     assert data["bazelrc_tag"] == expected_bazelrc_tag
     assert data["live_value"] == "initial"
+
+
+def test_ci_cache_matches_bazel_versions() -> None:
+    ci_yml = _REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    content = ci_yml.read_text(encoding="utf-8")
+    expected_key = (
+        f"key: bazel-int-${{{{ runner.os }}}}-"
+        f"{_bazel._BAZELISK_VERSION}-{'-'.join(_BAZEL_VERSIONS)}"
+    )
+    assert "~/.cache/bazel517\n" in content
+    assert expected_key in content
 
 
 @pytest.mark.parametrize(
@@ -452,33 +433,75 @@ def _verify_built_wheel(
     ),
     [
         # 1. Standalone `bazel` 7.4.1 on PATH matches `.bazelversion` 7.4.1
-        ("7.4.1", "bazelversion", "standalone", ("7.4.1",), False),
+        (
+            "7.4.1",
+            _VersionSource.BAZELVERSION,
+            _InstalledKind.STANDALONE,
+            ("7.4.1",),
+            False,
+        ),
         # 2. Standalone `bazel` 7.4.1 on PATH does NOT match `.bazelversion` 8.6.0
         # -> skips PATH `bazel` 7.4.1 and falls back to bazelisk to run real Bazel 8.6.0
-        ("8.6.0", "bazelversion", "standalone", ("7.4.1",), True),
+        (
+            "8.6.0",
+            _VersionSource.BAZELVERSION,
+            _InstalledKind.STANDALONE,
+            ("7.4.1",),
+            True,
+        ),
         # 3. Standalone `bazel` 8.6.0 on PATH satisfies floating `.bazelversion` `8.x`
-        ("8.6.0", "bazelversion_floating", "standalone", ("8.6.0",), False),
+        (
+            "8.6.0",
+            _VersionSource.BAZELVERSION_FLOATING,
+            _InstalledKind.STANDALONE,
+            ("8.6.0",),
+            False,
+        ),
         # 4. Standalone `bazel` 8.6.0 on PATH does NOT match `.bazeliskrc` (7.4.1)
         # -> falls back to bazelisk to run real Bazel 7.4.1
-        ("7.4.1", "bazeliskrc", "standalone", ("8.6.0",), True),
+        (
+            "7.4.1",
+            _VersionSource.BAZELISKRC,
+            _InstalledKind.STANDALONE,
+            ("8.6.0",),
+            True,
+        ),
         # 5. Multi-version `bazel` wrapper on PATH with both 7.4.1 and 8.6.0 installed
         # dispatches directly to 7.4.1 when `.bazelversion` requires 7.4.1
-        ("7.4.1", "bazelversion", "wrapper", ("7.4.1", "8.6.0"), False),
+        (
+            "7.4.1",
+            _VersionSource.BAZELVERSION,
+            _InstalledKind.WRAPPER,
+            ("7.4.1", "8.6.0"),
+            False,
+        ),
         # 6. Multi-version `bazel` wrapper on PATH with both 7.4.1 and 8.6.0 installed
         # dispatches directly to 8.6.0 when `.bazelversion` requires 8.6.0
-        ("8.6.0", "bazelversion", "wrapper", ("7.4.1", "8.6.0"), False),
+        (
+            "8.6.0",
+            _VersionSource.BAZELVERSION,
+            _InstalledKind.WRAPPER,
+            ("7.4.1", "8.6.0"),
+            False,
+        ),
         # 7. Multi-version `bazel` wrapper on PATH with only 7.4.1 installed fails on
         # `.bazelversion` 8.6.0 -> falls back to bazelisk to run real Bazel 8.6.0
-        ("8.6.0", "bazelversion", "wrapper", ("7.4.1",), True),
+        (
+            "8.6.0",
+            _VersionSource.BAZELVERSION,
+            _InstalledKind.WRAPPER,
+            ("7.4.1",),
+            True,
+        ),
     ],
 )
 def test_real_bazel_wheel_and_editable_across_versions(
-    real_bazel_env: RealBazelEnv,
+    real_bazel_env: _RealBazelEnv,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     required_version: str,
-    version_source: str,
-    installed_kind: str,
+    version_source: _VersionSource,
+    installed_kind: _InstalledKind,
     installed_versions: Sequence[str],
     expect_fallback_to_bazelisk: bool,
 ) -> None:
@@ -486,17 +509,18 @@ def test_real_bazel_wheel_and_editable_across_versions(
     major_minor = ".".join(required_version.split(".")[:2])
     tag = f"tag_{required_version.replace('.', '_')}_{installed_kind}"
 
-    if version_source == "bazelversion":
+    if version_source == _VersionSource.BAZELVERSION:
         bv_text: str | None = f"{required_version}\n"
         brc_text: str | None = None
-    elif version_source == "bazelversion_floating":
+    elif version_source == _VersionSource.BAZELVERSION_FLOATING:
         major = required_version.split(".")[0]
         bv_text = f"{major}.x\n"
         brc_text = None
-    else:
-        assert version_source == "bazeliskrc"
+    elif version_source == _VersionSource.BAZELISKRC:
         bv_text = None
         brc_text = f"USE_BAZEL_VERSION={required_version}\n"
+    else:
+        raise ValueError(f"Unsupported version_source: {version_source!r}")
 
     _configure_workspace(
         ws,
@@ -510,7 +534,7 @@ def test_real_bazel_wheel_and_editable_across_versions(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     exe_suffix = ".exe" if sys.platform == "win32" else ""
-    if installed_kind == "standalone":
+    if installed_kind == _InstalledKind.STANDALONE:
         only_ver = installed_versions[0]
         src_bin = real_bazel_env.bazel_bins[only_ver]
         dst_bin = bin_dir / f"bazel{exe_suffix}"
@@ -518,13 +542,14 @@ def test_real_bazel_wheel_and_editable_across_versions(
             dst_bin.symlink_to(src_bin)
         except OSError:
             shutil.copy2(src_bin, dst_bin)
-    else:
-        assert installed_kind == "wrapper"
+    elif installed_kind == _InstalledKind.WRAPPER:
         _install_bazel_wrapper(
             bin_dir,
             {v: real_bazel_env.bazel_bins[v] for v in installed_versions},
             default_version=installed_versions[-1],
         )
+    else:
+        raise ValueError(f"Unsupported installed_kind: {installed_kind!r}")
 
     monkeypatch.chdir(ws)
     monkeypatch.delenv("BAZEL_BIN", raising=False)
@@ -573,26 +598,29 @@ def test_real_bazel_wheel_and_editable_across_versions(
 
     # Verify live workspace source edits take effect without rebuilding
     (ws / "src" / "sample_pkg" / "__init__.py").write_text(
-        """\
-from ._build_info import BAZEL_VERSION, BAZELRC_TAG
+        textwrap.dedent(
+            """\
+            from ._build_info import BAZEL_VERSION, BAZELRC_TAG
 
-LIVE_VALUE = "edited_live"
-""",
+            LIVE_VALUE = "edited_live"
+            """
+        ),
         encoding="utf-8",
     )
+    live_script = textwrap.dedent(
+        f"""\
+        import site
+
+        site.addsitedir({str(site_edit)!r})
+        import sample_pkg
+
+        assert sample_pkg.LIVE_VALUE == "edited_live"
+        assert sample_pkg.BAZEL_VERSION == {required_version!r}
+        assert sample_pkg.BAZELRC_TAG == {f"{tag}_editable"!r}
+        """
+    )
     live_check = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            (
-                f"import site; site.addsitedir({str(site_edit)!r}); "
-                "import sample_pkg; "
-                "assert sample_pkg.LIVE_VALUE == 'edited_live'; "
-                f"assert sample_pkg.BAZEL_VERSION == {required_version!r}; "
-                f"assert sample_pkg.BAZELRC_TAG == {f'{tag}_editable'!r}"
-            ),
-        ],
+        [sys.executable, "-I", "-c", live_script],
         check=True,
         capture_output=True,
         text=True,

@@ -83,8 +83,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
+            ~/.cache/bazel517
             ~/.cache/bazel517-test-bazelisk
             ~/.cache/bazel517-test-repo-cache
-          key: bazel-int-${{ runner.os }}-7.4.1-8.6.0
+          key: bazel-int-${{ runner.os }}-v1.29.0-7.4.1-8.6.0
       - name: Run pytest
         run: uv run --python ${{ matrix.python-version }} --group test pytest --cov

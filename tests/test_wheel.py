@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import pathlib
@@ -22,12 +22,14 @@ import platform
 import shutil
 import subprocess
 import sys
+import textwrap
 from typing import Any
 import zipfile
 
 import pytest
 
 import bazel517
+import conftest
 
 
 def test_get_requires_for_build_wheel() -> None:
@@ -66,18 +68,21 @@ def test_build_wheel_as_installed(
         assert "mypkg-0.1.0.dist-info/METADATA" in names
         zf.extractall(site_std)
 
+    check_script = textwrap.dedent(
+        f"""\
+        import site
+
+        site.addsitedir({str(site_std)!r})
+        import mypkg
+        import mypkg._generated
+
+        assert mypkg.X == 42
+        assert isinstance(mypkg._generated.GENERATED, bool)
+        assert mypkg._generated.GENERATED
+        """
+    )
     std_check = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            (
-                f"import site; site.addsitedir({str(site_std)!r}); "
-                "import mypkg, mypkg._generated; "
-                "assert mypkg.X == 42; "
-                "assert mypkg._generated.GENERATED is True"
-            ),
-        ],
+        [sys.executable, "-I", "-c", check_script],
         cwd=tmp_path,
         check=True,
         capture_output=True,
@@ -90,7 +95,7 @@ def test_build_wheel_bep_file_entries(
     project_dir: pathlib.Path,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    fake_bazel_factory: Callable[..., pathlib.Path],
+    fake_bazel_factory: conftest.FakeBazelFactory,
 ) -> None:
     monkeypatch.chdir(project_dir)
     abs_whl = (
@@ -148,7 +153,7 @@ def test_build_wheel_error_conditions(
     project_dir: pathlib.Path,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    fake_bazel_factory: Callable[..., pathlib.Path],
+    fake_bazel_factory: conftest.FakeBazelFactory,
     setup_kwargs: Mapping[str, Any],
     expected_match: str,
 ) -> None:
@@ -161,21 +166,23 @@ def test_build_wheel_error_conditions(
 def test_bazel_bin_path_resolution_and_bazelisk_fallback_download(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    fake_bazel_factory: Callable[..., pathlib.Path],
+    fake_bazel_factory: conftest.FakeBazelFactory,
 ) -> None:
     proj = tmp_path / "proj_dl"
     pkg = proj / "src" / "mypkg"
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text("X = 1\n", encoding="utf-8")
     (proj / "pyproject.toml").write_text(
-        """
-[build-system]
-requires = ["bazel517"]
-build-backend = "bazel517"
+        textwrap.dedent(
+            """\
+            [build-system]
+            requires = ["bazel517"]
+            build-backend = "bazel517"
 
-[tool.bazel517]
-target = "//ci/wheel:mypkg_wheel"
-""",
+            [tool.bazel517]
+            target = "//ci/wheel:mypkg_wheel"
+            """
+        ),
         encoding="utf-8",
     )
     monkeypatch.chdir(proj)
@@ -292,7 +299,7 @@ target = "//ci/wheel:mypkg_wheel"
             "8.6.0",
             None,
             "8.6.0",
-            ["build --require_bazel_major=8"],
+            ("build --require_bazel_major=8",),
         ),
         # 2. `.bazelversion` with vendor suffix on installed `bazel` (8.6.0-homebrew)
         (
@@ -304,7 +311,7 @@ target = "//ci/wheel:mypkg_wheel"
             "8.6.0-homebrew",
             None,
             "8.6.0-homebrew",
-            ["build --require_bazel_major=8 --define=homebrew_bazel=1"],
+            ("build --require_bazel_major=8 --define=homebrew_bazel=1",),
         ),
         # 3. Floating minor range `8.x` satisfied by installed `bazel` 8.6.0
         (
@@ -316,7 +323,7 @@ target = "//ci/wheel:mypkg_wheel"
             "8.6.0",
             None,
             "8.6.0",
-            ["build --require_bazel_major=8 --enable_bzlmod"],
+            ("build --require_bazel_major=8 --enable_bzlmod",),
         ),
         # 4. Version mismatch: `.bazelversion` requires 8.6.0, but standalone `bazel`
         # on PATH is 7.4.1 -> skips PATH `bazel` and falls back to bazelisk (8.6.0)
@@ -329,7 +336,7 @@ target = "//ci/wheel:mypkg_wheel"
             "7.4.1",
             None,
             "8.6.0",
-            ["build --require_bazel_major=8 --incompatible_autoload_externally="],
+            ("build --require_bazel_major=8 --incompatible_autoload_externally=",),
         ),
         # 5. Floating range mismatch: `.bazelversion` requires `8.x`, but standalone
         # `bazel` on PATH is 7.4.1 -> falls back to bazelisk (8.0)
@@ -342,7 +349,7 @@ target = "//ci/wheel:mypkg_wheel"
             "7.4.1",
             None,
             "8.0",
-            ["build --require_bazel_major=8 --define=series=8"],
+            ("build --require_bazel_major=8 --define=series=8",),
         ),
         # 6. Multi-version `bazel` wrapper on PATH with 7.4.1 and 8.6.0 installed:
         # project requires 7.4.1 -> wrapper dispatches to 7.4.1
@@ -355,7 +362,7 @@ target = "//ci/wheel:mypkg_wheel"
             "8.6.0",
             ("7.4.1", "8.6.0"),
             "7.4.1",
-            ["build --require_bazel_major=7 --noenable_bzlmod"],
+            ("build --require_bazel_major=7 --noenable_bzlmod",),
         ),
         # 7. Multi-version `bazel` wrapper on PATH with 7.4.1 and 8.6.0 installed:
         # project requires 9.0.0 (not installed) -> wrapper exits non-zero on
@@ -369,7 +376,7 @@ target = "//ci/wheel:mypkg_wheel"
             "8.6.0",
             ("7.4.1", "8.6.0"),
             "9.0.0",
-            ["build --require_bazel_major=9"],
+            ("build --require_bazel_major=9",),
         ),
         # 8. `.bazeliskrc` specifies `USE_BAZEL_VERSION=7.4.1` while standalone `bazel`
         # on PATH is 8.6.0 -> falls back to bazelisk (7.4.1)
@@ -382,7 +389,7 @@ target = "//ci/wheel:mypkg_wheel"
             "8.6.0",
             None,
             "7.4.1",
-            ["build --require_bazel_major=7 --define=from_bazeliskrc=1"],
+            ("build --require_bazel_major=7 --define=from_bazeliskrc=1",),
         ),
         # 9. `.bazeliskrc` without `USE_BAZEL_VERSION` falls through to `.bazelversion`
         (
@@ -394,9 +401,22 @@ target = "//ci/wheel:mypkg_wheel"
             "8.6.0",
             None,
             "8.6.0",
-            ["build --require_bazel_major=8"],
+            ("build --require_bazel_major=8",),
         ),
-        # 10. `USE_BAZEL_VERSION` overrides `.bazelversion` when standalone `bazel` on
+        # 10. `.bazeliskrc` with empty `USE_BAZEL_VERSION=` falls through to
+        # `.bazelversion` (8.6.0), rejecting standalone `bazel` 7.4.1 on PATH
+        (
+            "8.6.0\n",
+            "USE_BAZEL_VERSION=\n",
+            None,
+            "build --require_bazel_major=8 --define=empty_bazeliskrc_fallthrough=1\n",
+            "bazel",
+            "7.4.1",
+            None,
+            "8.6.0",
+            ("build --require_bazel_major=8 --define=empty_bazeliskrc_fallthrough=1",),
+        ),
+        # 11. `USE_BAZEL_VERSION` overrides `.bazelversion` when standalone `bazel` on
         # PATH is 8.6.0 -> falls back to bazelisk to run 7.4.1
         (
             "8.6.0\n",
@@ -407,9 +427,9 @@ target = "//ci/wheel:mypkg_wheel"
             "8.6.0",
             None,
             "7.4.1",
-            ["build --require_bazel_major=7 --define=from_env_version=7.4.1"],
+            ("build --require_bazel_major=7 --define=from_env_version=7.4.1",),
         ),
-        # 11. `USE_BAZEL_VERSION=latest` accepts installed `bazel` 7.4.1 on PATH
+        # 12. `USE_BAZEL_VERSION=latest` accepts installed `bazel` 7.4.1 on PATH
         (
             "8.6.0\n",
             None,
@@ -419,9 +439,21 @@ target = "//ci/wheel:mypkg_wheel"
             "7.4.1",
             None,
             "7.4.1",
-            ["build --require_bazel_major=7 --define=latest_ok=1"],
+            ("build --require_bazel_major=7 --define=latest_ok=1",),
         ),
-        # 12. `.bazelversion` set to `latest` accepts installed `bazel` 7.4.1 on PATH
+        # 13. `.bazeliskrc` `USE_BAZEL_VERSION=latest` accepts `bazel` 7.4.1 on PATH
+        (
+            "8.6.0\n",
+            "USE_BAZEL_VERSION=latest\n",
+            None,
+            "build --require_bazel_major=7 --define=brc_latest_ok=1\n",
+            "bazel",
+            "7.4.1",
+            None,
+            "7.4.1",
+            ("build --require_bazel_major=7 --define=brc_latest_ok=1",),
+        ),
+        # 14. `.bazelversion` set to `latest` accepts installed `bazel` 7.4.1 on PATH
         (
             "latest\n",
             None,
@@ -431,9 +463,9 @@ target = "//ci/wheel:mypkg_wheel"
             "7.4.1",
             None,
             "7.4.1",
-            ["build --require_bazel_major=7 --define=bv_latest=1"],
+            ("build --require_bazel_major=7 --define=bv_latest=1",),
         ),
-        # 13. `.bazelversion` with only comments/blank lines accepts installed `bazel`
+        # 15. `.bazelversion` with only comments/blank lines accepts installed `bazel`
         (
             "# comment only\n   \n",
             None,
@@ -443,9 +475,9 @@ target = "//ci/wheel:mypkg_wheel"
             "7.4.1",
             None,
             "7.4.1",
-            ["build --require_bazel_major=7 --define=unconstrained=1"],
+            ("build --require_bazel_major=7 --define=unconstrained=1",),
         ),
-        # 14. Broken `bazel` on PATH whose `--version` output is malformed when a
+        # 16. Broken `bazel` on PATH whose `--version` output is malformed when a
         # specific version is required -> falls back to bazelisk
         (
             "8.6.0\n",
@@ -456,9 +488,57 @@ target = "//ci/wheel:mypkg_wheel"
             "malformed",
             None,
             "8.6.0",
-            ["build --require_bazel_major=8 --define=fallback_from_malformed=1"],
+            ("build --require_bazel_major=8 --define=fallback_from_malformed=1",),
         ),
-        # 15. `bazelisk` on PATH handles any required version directly without fallback
+        # 17. Pre-release `bazel` (`8.6.0-rc1`) on PATH does NOT satisfy stable `8.6.0`
+        (
+            "8.6.0\n",
+            None,
+            None,
+            "build --require_bazel_major=8 --define=reject_rc_hyphen=1\n",
+            "bazel",
+            "8.6.0-rc1",
+            None,
+            "8.6.0",
+            ("build --require_bazel_major=8 --define=reject_rc_hyphen=1",),
+        ),
+        # 18. Rolling pre-release (`8.6.0-pre.20250101.1`) does NOT satisfy `8.x`
+        (
+            "8.x\n",
+            None,
+            None,
+            "build --require_bazel_major=8 --define=reject_rolling_pre=1\n",
+            "bazel",
+            "8.6.0-pre.20250101.1",
+            None,
+            "8.0",
+            ("build --require_bazel_major=8 --define=reject_rolling_pre=1",),
+        ),
+        # 19. Inline RC (`8.6.0rc1`) does NOT satisfy `8.x`
+        (
+            "8.x\n",
+            None,
+            None,
+            "build --require_bazel_major=8 --define=reject_inline_rc=1\n",
+            "bazel",
+            "8.6.0rc1",
+            None,
+            "8.0",
+            ("build --require_bazel_major=8 --define=reject_inline_rc=1",),
+        ),
+        # 20. Exact pre-release pin (`8.6.0-rc1`) DOES match `8.6.0-rc1` on PATH
+        (
+            "8.6.0-rc1\n",
+            None,
+            None,
+            "build --require_bazel_major=8 --define=exact_rc_ok=1\n",
+            "bazel",
+            "8.6.0-rc1",
+            None,
+            "8.6.0-rc1",
+            ("build --require_bazel_major=8 --define=exact_rc_ok=1",),
+        ),
+        # 21. `bazelisk` on PATH handles any required version directly without fallback
         (
             "7.4.1\n",
             None,
@@ -468,14 +548,14 @@ target = "//ci/wheel:mypkg_wheel"
             "8.6.0",
             ("*",),
             "7.4.1",
-            ["build --require_bazel_major=7 --define=via_path_bazelisk=1"],
+            ("build --require_bazel_major=7 --define=via_path_bazelisk=1",),
         ),
     ],
 )
 def test_resolve_bazel_bin_version_matching_unit(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    fake_bazel_factory: Callable[..., pathlib.Path],
+    fake_bazel_factory: conftest.FakeBazelFactory,
     bazelversion_content: str | None,
     bazeliskrc_content: str | None,
     use_bazel_version: str | None,
@@ -484,26 +564,28 @@ def test_resolve_bazel_bin_version_matching_unit(
     path_bazel_version: str,
     path_installed_versions: Sequence[str] | None,
     expected_active_version: str,
-    expected_bazelrc_flags: list[str],
+    expected_bazelrc_flags: Sequence[str],
 ) -> None:
     proj = tmp_path / "proj_ver"
     pkg = proj / "src" / "mypkg"
     pkg.mkdir(parents=True)
     (pkg / "__init__.py").write_text("X = 42\n", encoding="utf-8")
     (proj / "pyproject.toml").write_text(
-        """
-[build-system]
-requires = ["bazel517"]
-build-backend = "bazel517"
+        textwrap.dedent(
+            """\
+            [build-system]
+            requires = ["bazel517"]
+            build-backend = "bazel517"
 
-[project]
-name = "mypkg"
-version = "0.1.0"
+            [project]
+            name = "mypkg"
+            version = "0.1.0"
 
-[tool.bazel517]
-target = "//ci/wheel:mypkg_wheel"
-bazel-args = ["-c", "opt"]
-""",
+            [tool.bazel517]
+            target = "//ci/wheel:mypkg_wheel"
+            bazel-args = ["-c", "opt"]
+            """
+        ),
         encoding="utf-8",
     )
     if bazelversion_content is not None:
@@ -575,4 +657,4 @@ bazel-args = ["-c", "opt"]
     assert len(invocations) == 1
     assert invocations[0]["cmd"] == "build"
     assert invocations[0]["bazel_version"] == expected_active_version
-    assert invocations[0]["bazelrc_flags"] == expected_bazelrc_flags
+    assert tuple(invocations[0]["bazelrc_flags"]) == expected_bazelrc_flags

@@ -14,17 +14,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 import json
 import pathlib
 import subprocess
 import sys
+import textwrap
 from typing import Any
 import zipfile
 
 import pytest
 
 import bazel517
+import conftest
 
 
 def test_get_requires_for_build_editable() -> None:
@@ -36,6 +38,7 @@ def test_build_editable_as_installed(
     project_dir: pathlib.Path,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    subtests: pytest.Subtests,
 ) -> None:
     monkeypatch.chdir(project_dir)
 
@@ -53,61 +56,88 @@ def test_build_editable_as_installed(
         assert "mypkg/__init__.py" not in names
         zf.extractall(site_edit)
 
-    check_script = (
-        f"import importlib.util, json, pathlib, site; "
-        f"site.addsitedir({str(site_edit)!r}); "
-        "import _editable_mypkg; _editable_mypkg.install(); "
-        "import mypkg, mypkg._generated; "
-        "ext_spec = importlib.util.find_spec('mypkg._ext'); "
-        "assert ext_spec is not None and ext_spec.origin is not None; "
-        "print(json.dumps({"
-        "'x': mypkg.X, "
-        "'init': str(pathlib.Path(mypkg.__file__).resolve()), "
-        "'gen': mypkg._generated.GENERATED, "
-        "'gen_file': str(pathlib.Path(mypkg._generated.__file__).resolve()), "
-        "'ext_origin': str(pathlib.Path(ext_spec.origin).resolve())"
-        "}))"
-    )
-    res1 = subprocess.run(
-        [sys.executable, "-I", "-c", check_script],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    info1 = json.loads(res1.stdout.strip())
-    assert info1["x"] == 42
-    assert info1["init"] == str(
-        (project_dir / "src" / "mypkg" / "__init__.py").resolve()
-    )
-    assert info1["gen"] is True
-    assert info1["gen_file"] == str((site_edit / "mypkg" / "_generated.py").resolve())
-    expected_ext = "_ext.pyd" if sys.platform == "win32" else "_ext.so"
-    assert info1["ext_origin"] == str((site_edit / "mypkg" / expected_ext).resolve())
+    # Unpack the editable wheel into `site_edit` and run an isolated interpreter
+    # (`-I`) via `site.addsitedir` so `_editable_mypkg.pth` installs the finder
+    # hook automatically. Importing `mypkg` must merge `mypkg.__path__` across:
+    #   1. Live workspace `.py` sources (`src/mypkg/__init__.py` in `project_dir`)
+    #   2. Bazel-generated `.py` outputs (`mypkg/_generated.py` in `site_edit`)
+    #   3. Bazel-built C extensions (`mypkg/_ext.{so,pyd}` in `site_edit`, checked
+    #      via `find_spec` because `fake_bazel` writes placeholder binary bytes)
+    check_script = textwrap.dedent(
+        f"""\
+        import importlib.util
+        import json
+        import pathlib
+        import site
 
-    # Edit workspace source file without rebuilding and verify live change + extension
-    (project_dir / "src" / "mypkg" / "__init__.py").write_text(
-        "from . import _generated\nX = 99\n",
-        encoding="utf-8",
+        site.addsitedir({str(site_edit)!r})
+        import mypkg
+        import mypkg._generated
+
+        ext_spec = importlib.util.find_spec("mypkg._ext")
+        assert ext_spec is not None and ext_spec.origin is not None
+        print(
+            json.dumps(
+                {{
+                    "init_x": mypkg.X,
+                    "init_file": str(pathlib.Path(mypkg.__file__).resolve()),
+                    "generated_flag": mypkg._generated.GENERATED,
+                    "generated_file": str(
+                        pathlib.Path(mypkg._generated.__file__).resolve()
+                    ),
+                    "ext_origin": str(pathlib.Path(ext_spec.origin).resolve()),
+                }}
+            )
+        )
+        """
     )
-    res2 = subprocess.run(
-        [sys.executable, "-I", "-c", check_script],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    info2 = json.loads(res2.stdout.strip())
-    assert info2["x"] == 99
-    assert info2["gen"] is True
-    assert info2["ext_origin"] == str((site_edit / "mypkg" / expected_ext).resolve())
+    expected_ext = "_ext.pyd" if sys.platform == "win32" else "_ext.so"
+    expected_ext_path = str((site_edit / "mypkg" / expected_ext).resolve())
+
+    with subtests.test("initial import merges workspace sources and built artifacts"):
+        res1 = subprocess.run(
+            [sys.executable, "-I", "-c", check_script],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        info1 = json.loads(res1.stdout.strip())
+        assert info1["init_x"] == 42
+        assert info1["init_file"] == str(
+            (project_dir / "src" / "mypkg" / "__init__.py").resolve()
+        )
+        assert isinstance(info1["generated_flag"], bool)
+        assert info1["generated_flag"]
+        assert info1["generated_file"] == str(
+            (site_edit / "mypkg" / "_generated.py").resolve()
+        )
+        assert info1["ext_origin"] == expected_ext_path
+
+    with subtests.test("live workspace edit takes effect without rebuild"):
+        (project_dir / "src" / "mypkg" / "__init__.py").write_text(
+            "from . import _generated\nX = 99\n",
+            encoding="utf-8",
+        )
+        res2 = subprocess.run(
+            [sys.executable, "-I", "-c", check_script],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        info2 = json.loads(res2.stdout.strip())
+        assert info2["init_x"] == 99
+        assert isinstance(info2["generated_flag"], bool)
+        assert info2["generated_flag"]
+        assert info2["ext_origin"] == expected_ext_path
 
 
 def test_build_editable_bep_canonical_flags_and_edge_cases(
     project_dir: pathlib.Path,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    fake_bazel_factory: Callable[..., pathlib.Path],
+    fake_bazel_factory: conftest.FakeBazelFactory,
 ) -> None:
     monkeypatch.chdir(project_dir)
     abs_inputs = (
@@ -206,8 +236,7 @@ def test_build_editable_bep_canonical_flags_and_edge_cases(
     }
 
     log_file = tmp_path / "bazel_invocations.jsonl"
-    if log_file.exists():
-        log_file.unlink()
+    log_file.unlink(missing_ok=True)
 
     fake_bazel_factory(
         tmp_path,
@@ -287,7 +316,7 @@ def test_build_editable_error_conditions(
     project_dir: pathlib.Path,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
-    fake_bazel_factory: Callable[..., pathlib.Path],
+    fake_bazel_factory: conftest.FakeBazelFactory,
     setup_kwargs: Mapping[str, Any],
     expected_match: str,
 ) -> None:
