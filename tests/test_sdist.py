@@ -26,6 +26,53 @@ import pytest
 import bazel517
 
 
+@pytest.mark.parametrize(
+    "project_subdir",
+    [
+        pytest.param(".", id="repository-root"),
+        pytest.param(
+            "python",
+            id="repository-subdirectory",
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=AssertionError,
+                reason="https://github.com/google/bazel517/issues/6",
+            ),
+        ),
+    ],
+)
+def test_build_sdist_excludes_git_ignored_files(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project_subdir: str,
+) -> None:
+    repository = tmp_path / "repository"
+    project = repository / project_subdir
+    project.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    (repository / ".gitignore").write_text(".env\n", encoding="utf-8")
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "gitpkg"\nversion = "1.0.0"\n',
+        encoding="utf-8",
+    )
+    (project / "tracked.py").write_text("X = 1\n", encoding="utf-8")
+    (project / ".env").write_text("DUMMY_TOKEN=not-a-real-secret\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    # Verify that the parent ignore rule applies before inspecting the archive.
+    subprocess.run(["git", "check-ignore", "-q", ".env"], cwd=project, check=True)
+    monkeypatch.chdir(project)
+    sdist_dir = tmp_path / "dist"
+
+    sdist_name = bazel517.build_sdist(str(sdist_dir))
+
+    with tarfile.open(sdist_dir / sdist_name, "r:gz") as archive:
+        names = set(archive.getnames())
+    assert "gitpkg-1.0.0/pyproject.toml" in names
+    assert "gitpkg-1.0.0/tracked.py" in names
+    assert "gitpkg-1.0.0/PKG-INFO" in names
+    assert "gitpkg-1.0.0/.env" not in names
+
+
 def test_build_sdist_walk_fallback_excludes_ignored_dirs_and_bytecode(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
