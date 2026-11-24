@@ -15,13 +15,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import json
 import pathlib
 import stat
 import subprocess
 import sys
-from typing import Any, Protocol
+import textwrap
+from typing import Any, Final, Protocol
 
 import pytest
+
+_DATA_DIR: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parent / "data"
+_FAKE_BAZEL_SCRIPT: Final[pathlib.Path] = _DATA_DIR / "fake_bazel.py"
 
 
 class FakeBazelFactory(Protocol):
@@ -37,7 +42,84 @@ class FakeBazelFactory(Protocol):
         aquery_actions: Sequence[Mapping[str, Any]] | None = None,
         write_inputs_txt: bool = True,
         extra_input_lines: Sequence[str] = (),
+        bazel_version: str = "8.6.0",
+        installed_versions: Sequence[str] | None = None,
+        log_dir: pathlib.Path | None = None,
     ) -> pathlib.Path: ...
+
+
+def build_python_shim(
+    bin_dir: pathlib.Path,
+    name: str,
+    script_path: pathlib.Path,
+    config_path: pathlib.Path,
+) -> pathlib.Path:
+    """Create a standalone executable shim in `bin_dir` invoking `script_path`.
+
+    Passes `config_path` as `sys.argv[1]` followed by any CLI arguments passed
+    to the shim. Compiles a native `.exe` via `csc.exe` on Windows (where
+    `shutil.which` and `CreateProcess` require an executable extension) and
+    writes a `#!` script on POSIX.
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        exe_path = bin_dir / f"{name}.exe"
+        if not exe_path.is_file():
+            cs_path = bin_dir / f"_{name}_shim.cs"
+            py_escaped = sys.executable.replace("\\", "\\\\")
+            script_escaped = str(script_path).replace("\\", "\\\\")
+            config_escaped = str(config_path).replace("\\", "\\\\")
+            cs_source = textwrap.dedent(
+                f"""\
+                using System;
+                using System.Diagnostics;
+                class P {{
+                    static int Main() {{
+                        string cmd = Environment.CommandLine;
+                        int i = 0;
+                        if (cmd.StartsWith("\\"")) {{
+                            i = cmd.IndexOf('"', 1) + 1;
+                        }} else {{
+                            while (i < cmd.Length && !char.IsWhiteSpace(cmd[i]))
+                                i++;
+                        }}
+                        string rest = cmd.Substring(i);
+                        string py = "{py_escaped}";
+                        string prefix = "\\"{script_escaped}\\" \\"{config_escaped}\\"";
+                        string args = prefix + rest;
+                        var psi = new ProcessStartInfo(py, args) {{
+                            UseShellExecute = false
+                        }};
+                        var p = Process.Start(psi);
+                        p.WaitForExit();
+                        return p.ExitCode;
+                    }}
+                }}
+                """
+            )
+            cs_path.write_text(cs_source, encoding="utf-8")
+            csc = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+            subprocess.run(
+                [csc, "/nologo", f"/out:{exe_path}", str(cs_path)],
+                check=True,
+                capture_output=True,
+            )
+        return exe_path
+
+    shim_path = bin_dir / name
+    shim_source = textwrap.dedent(
+        f"""\
+        #!{sys.executable}
+        import runpy
+        import sys
+
+        sys.argv = [{str(script_path)!r}, {str(config_path)!r}, *sys.argv[1:]]
+        runpy.run_path({str(script_path)!r}, run_name="__main__")
+        """
+    )
+    shim_path.write_text(shim_source, encoding="utf-8")
+    shim_path.chmod(shim_path.stat().st_mode | stat.S_IEXEC)
+    return shim_path
 
 
 def _write_fake_bazel(
@@ -51,9 +133,13 @@ def _write_fake_bazel(
     aquery_actions: Sequence[Mapping[str, Any]] | None = None,
     write_inputs_txt: bool = True,
     extra_input_lines: Sequence[str] = (),
+    bazel_version: str = "8.6.0",
+    installed_versions: Sequence[str] | None = None,
+    log_dir: pathlib.Path | None = None,
 ) -> pathlib.Path:
-    """Create an executable script simulating `bazel build` (with BEP) and `aquery`."""
-    fake_bazel = bin_dir / "fake_bazel"
+    """Create an executable shim simulating `bazel build` (with BEP) and `aquery`."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    effective_log_dir = log_dir if log_dir is not None else bin_dir
     wheel_bin_dir = workspace_dir / "bazel-out" / "k8-opt" / "bin" / "ci" / "wheel"
     out_whl = wheel_bin_dir / "mypkg-0.1.0-cp313-cp313-linux_x86_64.whl"
     inputs_txt = wheel_bin_dir / "mypkg_wheel_target_wrapped_inputs.txt"
@@ -85,129 +171,31 @@ def _write_fake_bazel(
         *extra_input_lines,
     ]
 
-    script = f"""#!{sys.executable}
-import json
-import os
-import pathlib
-import sys
-import zipfile
+    config_path = bin_dir / "_fake_bazel_config.json"
+    config_payload = {
+        "out_whl": str(out_whl),
+        "inputs_txt": str(inputs_txt),
+        "log_file": str(effective_log_dir / "bazel_invocations.jsonl"),
+        "bep_lines": list(bep_lines) if bep_lines is not None else None,
+        "default_version": bazel_version,
+        "installed_versions": (
+            list(installed_versions) if installed_versions is not None else None
+        ),
+        "write_inputs_txt": write_inputs_txt,
+        "input_lines": input_lines,
+        "create_wheel_file": create_wheel_file,
+        "include_dir_entry": include_dir_entry,
+        "include_record": include_record,
+        "actions_list": actions_list,
+    }
+    config_path.write_text(json.dumps(config_payload), encoding="utf-8")
 
-args = sys.argv[1:]
-cmd = args[0]
-out_whl = pathlib.Path({str(out_whl)!r})
-inputs_txt = pathlib.Path({str(inputs_txt)!r})
-log_file = pathlib.Path({str(bin_dir / "bazel_invocations.jsonl")!r})
-custom_bep_lines = {list(bep_lines) if bep_lines is not None else None!r}
-
-with log_file.open("a", encoding="utf-8") as lf:
-    lf.write(
-        json.dumps(
-            {{
-                "cmd": cmd,
-                "args": args,
-                "custom_env": os.environ.get("CUSTOM_BAZEL_VAR"),
-            }}
-        )
-        + "\\n"
+    return build_python_shim(
+        bin_dir=bin_dir,
+        name="fake_bazel",
+        script_path=_FAKE_BAZEL_SCRIPT,
+        config_path=config_path,
     )
-
-bep_path = None
-for arg in args:
-    if arg.startswith("--build_event_json_file="):
-        bep_path = pathlib.Path(arg.split("=", 1)[1])
-
-if cmd == "build":
-    out_whl.parent.mkdir(parents=True, exist_ok=True)
-    if {write_inputs_txt!r}:
-        inputs_txt.write_text(
-            {chr(10).join(input_lines)!r} + "\\n",
-            encoding="utf-8",
-        )
-    if {create_wheel_file!r}:
-        with zipfile.ZipFile(out_whl, "w") as zf:
-            if {include_dir_entry!r}:
-                zf.writestr("mypkg/", "")
-            zf.writestr("mypkg/__init__.py", "X = 42\\n")
-            zf.writestr("mypkg/_generated.py", "GENERATED = True\\n")
-            zf.writestr("mypkg/data.json", "{{}}\\n")
-            zf.writestr("mypkg/_ext.so", b"\\x7fELF-fake-shared-object")
-            zf.writestr("mypkg/_ext.pyd", b"MZ-fake-windows-pyd")
-            zf.writestr(
-                "mypkg-0.1.0.dist-info/METADATA",
-                "Metadata-Version: 2.4\\nName: mypkg\\nVersion: 0.1.0\\n",
-            )
-            zf.writestr(
-                "mypkg-0.1.0.dist-info/WHEEL",
-                "Wheel-Version: 1.0\\nTag: cp313-cp313-linux_x86_64\\n",
-            )
-            if {include_record!r}:
-                zf.writestr("mypkg-0.1.0.dist-info/RECORD", "")
-    if bep_path is not None:
-        if custom_bep_lines is not None:
-            bep_path.write_text("\\n".join(custom_bep_lines) + "\\n", encoding="utf-8")
-        else:
-            default_event = {{
-                "id": {{"namedSet": {{"id": "0"}}}},
-                "namedSetOfFiles": {{
-                    "files": [
-                        {{
-                            "name": out_whl.name,
-                            "uri": out_whl.as_uri(),
-                        }}
-                    ]
-                }},
-            }}
-            bep_path.write_text(json.dumps(default_event) + "\\n", encoding="utf-8")
-elif cmd == "aquery":
-    print(json.dumps({{"actions": {actions_list!r}}}))
-else:
-    sys.exit(2)
-"""
-    if sys.platform == "win32":
-        script_py = bin_dir / "_fake_bazel_impl.py"
-        script_py.write_text(script, encoding="utf-8")
-        fake_bazel_exe = bin_dir / "fake_bazel.exe"
-        if not fake_bazel_exe.is_file():
-            cs_path = bin_dir / "_fake_bazel_wrapper.cs"
-            py_escaped = sys.executable.replace("\\", "\\\\")
-            script_escaped = str(script_py).replace("\\", "\\\\")
-            cs_path.write_text(
-                "using System;\n"
-                "using System.Diagnostics;\n"
-                "class P {\n"
-                "    static int Main() {\n"
-                "        string cmd = Environment.CommandLine;\n"
-                "        int i = 0;\n"
-                '        if (cmd.StartsWith("\\"")) {\n'
-                "            i = cmd.IndexOf('\"', 1) + 1;\n"
-                "        } else {\n"
-                "            while (i < cmd.Length && !char.IsWhiteSpace(cmd[i]))\n"
-                "                i++;\n"
-                "        }\n"
-                "        string rest = cmd.Substring(i);\n"
-                f'        string py = "{py_escaped}";\n'
-                f'        string args = "\\"{script_escaped}\\"" + rest;\n'
-                "        var psi = new ProcessStartInfo(py, args) {\n"
-                "            UseShellExecute = false\n"
-                "        };\n"
-                "        var p = Process.Start(psi);\n"
-                "        p.WaitForExit();\n"
-                "        return p.ExitCode;\n"
-                "    }\n"
-                "}\n",
-                encoding="utf-8",
-            )
-            csc = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-            subprocess.run(
-                [csc, "/nologo", f"/out:{fake_bazel_exe}", str(cs_path)],
-                check=True,
-                capture_output=True,
-            )
-        return fake_bazel_exe
-
-    fake_bazel.write_text(script, encoding="utf-8")
-    fake_bazel.chmod(fake_bazel.stat().st_mode | stat.S_IEXEC)
-    return fake_bazel
 
 
 @pytest.fixture
@@ -230,28 +218,33 @@ def project_dir(
     fake_bazel = fake_bazel_factory(tmp_path, proj)
 
     (proj / "pyproject.toml").write_text(
-        f"""
-[build-system]
-requires = ["bazel517"]
-build-backend = "bazel517"
+        textwrap.dedent(
+            f"""\
+            [build-system]
+            requires = ["bazel517"]
+            build-backend = "bazel517"
 
-[project]
-name = "mypkg"
-version = "0.1.0"
-description = "Test package"
-license = "Apache-2.0"
-license-files = ["LICENSE"]
-requires-python = ">=3.11"
+            [project]
+            name = "mypkg"
+            version = "0.1.0"
+            description = "Test package"
+            license = "Apache-2.0"
+            license-files = ["LICENSE"]
+            requires-python = ">=3.11"
 
-[tool.bazel517]
-bazel-bin = {str(fake_bazel)!r}
-target = "//ci/wheel:mypkg_wheel"
-bazel-args = ["-c", "opt", "--define=py={{python_version}}"]
-editable-bazel-args = ["--config=editable", "--define=abi={{python_abi_tag}}"]
+            [tool.bazel517]
+            bazel-bin = {str(fake_bazel)!r}
+            target = "//ci/wheel:mypkg_wheel"
+            bazel-args = ["-c", "opt", "--define=py={{python_version}}"]
+            editable-bazel-args = [
+                "--config=editable",
+                "--define=abi={{python_abi_tag}}",
+            ]
 
-[tool.bazel517.env]
-CUSTOM_BAZEL_VAR = "py-{{python_version_nodot}}-{{freethreaded}}"
-""",
+            [tool.bazel517.env]
+            CUSTOM_BAZEL_VAR = "py-{{python_version_nodot}}-{{freethreaded}}"
+            """
+        ),
         encoding="utf-8",
     )
     return proj

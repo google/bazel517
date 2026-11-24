@@ -24,6 +24,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import shlex
 import shutil
 import stat
@@ -40,6 +41,10 @@ from . import _config
 _BAZELISK_VERSION: Final[str] = "v1.29.0"
 _DEFAULT_BAZELISK_BASE_URL: Final[str] = (
     f"https://github.com/bazelbuild/bazelisk/releases/download/{_BAZELISK_VERSION}"
+)
+_PRERELEASE_SUFFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(?:rc|pre|alpha|beta|dev|canary|snapshot)(?:[0-9._-]|$)",
+    re.IGNORECASE,
 )
 _OS_ALIASES: Final[Mapping[str, str]] = types.MappingProxyType(
     {
@@ -94,9 +99,10 @@ class BazelError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class WheelBuildResult:
-    """Output wheel path and canonicalized build flags from `bazel build`."""
+    """Output wheel path, resolved Bazel binary, and canonicalized build flags."""
 
     wheel_path: pathlib.Path
+    bazel_bin: str
     expanded_args: tuple[str, ...] | None = None
 
 
@@ -114,15 +120,15 @@ def _merged_env(extra_env: Mapping[str, str]) -> Mapping[str, str]:
     return env
 
 
-def _bazelisk_cache_dir() -> pathlib.Path:
-    if custom := os.environ.get("BAZEL517_CACHE_DIR"):
+def _bazelisk_cache_dir(env: Mapping[str, str]) -> pathlib.Path:
+    if custom := env.get("BAZEL517_CACHE_DIR"):
         return pathlib.Path(custom)
-    if xdg := os.environ.get("XDG_CACHE_HOME"):
+    if xdg := env.get("XDG_CACHE_HOME"):
         return pathlib.Path(xdg) / "bazel517"
     return pathlib.Path.home() / ".cache" / "bazel517"
 
 
-def _download_bazelisk() -> str:
+def _download_bazelisk(env: Mapping[str, str]) -> str:
     os_key = _OS_ALIASES.get(sys.platform, "")
     arch_key = _ARCH_ALIASES.get(platform.machine().lower(), "")
     asset = _BAZELISK_ASSETS.get((os_key, arch_key))
@@ -132,9 +138,9 @@ def _download_bazelisk() -> str:
             f"bazelisk binary is available for {sys.platform}/{platform.machine()}."
         )
     asset_name, default_sha256 = asset
-    expected_sha256 = os.environ.get("BAZEL517_BAZELISK_SHA256", default_sha256).lower()
+    expected_sha256 = env.get("BAZEL517_BAZELISK_SHA256", default_sha256).lower()
 
-    dest_dir = _bazelisk_cache_dir() / f"bazelisk-{_BAZELISK_VERSION}"
+    dest_dir = _bazelisk_cache_dir(env) / f"bazelisk-{_BAZELISK_VERSION}"
     dest_path = dest_dir / asset_name
     if (
         dest_path.is_file()
@@ -142,9 +148,9 @@ def _download_bazelisk() -> str:
     ):
         return str(dest_path)
 
-    base_url = os.environ.get(
-        "BAZEL517_BAZELISK_BASE_URL", _DEFAULT_BAZELISK_BASE_URL
-    ).rstrip("/")
+    base_url = env.get("BAZEL517_BAZELISK_BASE_URL", _DEFAULT_BAZELISK_BASE_URL).rstrip(
+        "/"
+    )
     url = f"{base_url}/{asset_name}"
     try:
         with urllib.request.urlopen(url, timeout=60) as resp:
@@ -168,19 +174,124 @@ def _download_bazelisk() -> str:
     return str(dest_path)
 
 
-def _resolve_bazel_bin(configured_bin: str | None) -> str:
+def _resolve_bazel_bin(
+    configured_bin: str | None,
+    project_root: pathlib.Path,
+    env: Mapping[str, str],
+) -> str:
     """Resolve the Bazel executable to invoke.
 
     Uses an explicitly configured binary first; otherwise prefers `bazelisk`
-    over `bazel` on `PATH`, and falls back to downloading a pinned `bazelisk`
-    release binary verified by SHA-256.
+    on `PATH` (letting `bazelisk` handle version selection itself). Only when
+    `bazelisk` is absent does this check whether a `bazel` binary on `PATH`
+    satisfies the workspace's version pin before falling back to downloading a
+    pinned `bazelisk` release binary verified by SHA-256.
     """
     if configured_bin is not None:
         return configured_bin
-    found = shutil.which("bazelisk") or shutil.which("bazel")
-    if found is not None:
-        return found
-    return _download_bazelisk()
+    search_path = env.get("PATH")
+    if bazelisk := shutil.which("bazelisk", path=search_path):
+        return bazelisk
+    if (bazel := shutil.which("bazel", path=search_path)) and _is_usable_bazel(
+        bazel, project_root, env
+    ):
+        return bazel
+    return _download_bazelisk(env)
+
+
+def _is_usable_bazel(
+    bazel_bin: str,
+    project_root: pathlib.Path,
+    env: Mapping[str, str],
+) -> bool:
+    """Return whether an ambient `bazel` on `PATH` satisfies the workspace pin.
+
+    Unlike `bazelisk`, a standalone `bazel` binary ignores `.bazelversion` and
+    `USE_BAZEL_VERSION`, so we probe `bazel --version` whenever a version pin is
+    active. If no version pin is active, `bazel` is accepted directly without an
+    extra subprocess call so any broken installation surfaces normally during
+    `bazel build`. Similarly, `OSError` from spawning `bazel` is left uncaught
+    so broken binaries and transient OS errors are not silently masked.
+    """
+    required = _required_bazel_version(project_root, env)
+    if required is None:
+        return True
+    proc = subprocess.run(
+        [bazel_bin, "--version"],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        # Multi-version system `bazel` wrappers exit non-zero on `--version`
+        # when the workspace's `.bazelversion` is not installed locally; fall
+        # back to downloading `bazelisk` so it can fetch the requested version.
+        return False
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2 and parts[0].lower() == "bazel":
+            return _version_matches(parts[1], required)
+    return False
+
+
+def _required_bazel_version(
+    project_root: pathlib.Path,
+    env: Mapping[str, str],
+) -> str | None:
+    """Return the workspace's pinned Bazel version, or `None` if unconstrained.
+
+    Follows `bazelisk` precedence (`USE_BAZEL_VERSION` in `env`, then
+    `USE_BAZEL_VERSION=` in `.bazeliskrc`, then `.bazelversion`), treating
+    `"latest"` as unconstrained and falling through if an override is empty.
+    """
+    if env_ver := env.get("USE_BAZEL_VERSION", "").strip():
+        return None if env_ver == "latest" else env_ver
+
+    bazeliskrc_file = project_root / ".bazeliskrc"
+    if bazeliskrc_file.is_file():
+        for raw_line in bazeliskrc_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line.startswith("USE_BAZEL_VERSION="):
+                val = line.partition("=")[2].strip()
+                if not val:
+                    # Match `bazelisk`: an empty `USE_BAZEL_VERSION=` falls
+                    # through to `.bazelversion` rather than disabling it.
+                    break
+                return None if val == "latest" else val
+
+    bazelversion_file = project_root / ".bazelversion"
+    if bazelversion_file.is_file():
+        for raw_line in bazelversion_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line and not line.startswith("#"):
+                return None if line == "latest" else line
+    return None
+
+
+def _version_matches(actual: str, required: str) -> bool:
+    """Return whether `actual` (from `bazel --version`) satisfies `required`.
+
+    Allows distro build suffixes on stable releases (such as `8.6.0-homebrew`
+    or `8.6.0-` from archive builds) to match `8.6.0` or `8.x`, while rejecting
+    pre-release tags (`8.6.0-rc1`, `8.6.0rc1`, `8.6.0-pre.20250101.1`) unless
+    pinned to that exact pre-release string.
+    """
+    if actual == required:
+        return True
+    base, sep, suffix = actual.partition("-")
+    # Reject inline pre-releases such as `8.6.0rc1` (non-numeric segments) and
+    # hyphenated pre-releases such as `8.6.0-rc1` or `8.6.0-pre.20250101.1`.
+    if not all(part.isdigit() for part in base.split(".")):
+        return False
+    if sep and _PRERELEASE_SUFFIX_RE.match(suffix):
+        return False
+    if base == required:
+        return True
+    if required.endswith((".x", ".*")):
+        return base.startswith(required[:-1])
+    return False
 
 
 def _path_from_bep_file_entry(
@@ -262,9 +373,9 @@ def build_bazel_wheel_target(
     expansions are captured directly from `bazel build` in a single invocation
     without running `bazel cquery`.
     """
-    bazel_bin = _resolve_bazel_bin(bazel_cfg.bazel_bin)
-    flags = bazel_cfg.editable_bazel_args if editable else bazel_cfg.bazel_args
     env = _merged_env(bazel_cfg.env)
+    bazel_bin = _resolve_bazel_bin(bazel_cfg.bazel_bin, project_root, env)
+    flags = bazel_cfg.editable_bazel_args if editable else bazel_cfg.bazel_args
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         bep_path = pathlib.Path(tmp_dir) / "bep.json"
@@ -295,6 +406,7 @@ def build_bazel_wheel_target(
         )
     return WheelBuildResult(
         wheel_path=whl_paths[0],
+        bazel_bin=bazel_bin,
         expanded_args=expanded_args,
     )
 
@@ -331,6 +443,7 @@ def query_wheel_source_layout(
     project_root: pathlib.Path,
     bazel_cfg: _config.BazelConfig,
     *,
+    bazel_bin: str,
     editable: bool = True,
     expanded_args: Sequence[str] | None = None,
 ) -> WheelSourceLayout:
@@ -343,12 +456,11 @@ def query_wheel_source_layout(
     those already-expanded flags are passed instead of raw `--config` flags so
     `build:`-scoped `.bazelrc` definitions cannot diverge in `aquery`.
     """
-    bazel_bin = _resolve_bazel_bin(bazel_cfg.bazel_bin)
+    env = _merged_env(bazel_cfg.env)
     if expanded_args is not None:
         flags: Sequence[str] = expanded_args
     else:
         flags = bazel_cfg.editable_bazel_args if editable else bazel_cfg.bazel_args
-    env = _merged_env(bazel_cfg.env)
 
     aquery_cmd = [
         bazel_bin,

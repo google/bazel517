@@ -127,6 +127,7 @@ def build_editable_wheel(
     layout = _bazel.query_wheel_source_layout(
         cfg.project_root,
         cfg.bazel,
+        bazel_bin=build_res.bazel_bin,
         editable=True,
         expanded_args=build_res.expanded_args,
     )
