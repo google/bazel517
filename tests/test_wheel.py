@@ -23,6 +23,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import textwrap
 from typing import Any
 import zipfile
 
@@ -37,43 +38,13 @@ def test_get_requires_hooks() -> None:
     assert bazel517.get_requires_for_build_sdist() == []
 
 
-@pytest.mark.parametrize(
-    "requires_python, dependency, conflicting_field",
-    [
-        pytest.param(">=3.11", "packaging>=24", None, id="matching-metadata"),
-        pytest.param(
-            ">=99",
-            "packaging>=24",
-            "requires-python",
-            id="conflicting-requires-python",
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=pytest.fail.Exception,
-                reason="https://github.com/google/bazel517/issues/4",
-            ),
-        ),
-        pytest.param(
-            ">=3.11",
-            "packaging>=999",
-            "dependencies",
-            id="conflicting-dependencies",
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=pytest.fail.Exception,
-                reason="https://github.com/google/bazel517/issues/4",
-            ),
-        ),
-    ],
-)
-def test_build_wheel_validates_static_project_metadata(
+@pytest.fixture
+def static_metadata_project(
     project_dir: pathlib.Path,
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     fake_bazel_factory: Callable[..., pathlib.Path],
-    requires_python: str,
-    dependency: str,
-    conflicting_field: str | None,
-) -> None:
+) -> Callable[[str, str], None]:
     fake_bazel = fake_bazel_factory(
         tmp_path,
         project_dir,
@@ -82,38 +53,73 @@ def test_build_wheel_validates_static_project_metadata(
             "Requires-Python: >=3.11\nRequires-Dist: packaging>=24\n"
         ),
     )
-    (project_dir / "pyproject.toml").write_text(
-        f"""
-[build-system]
-requires = ["bazel517"]
-build-backend = "bazel517"
-
-[project]
-name = "mypkg"
-version = "0.1.0"
-requires-python = "{requires_python}"
-dependencies = ["{dependency}"]
-
-[tool.bazel517]
-bazel-bin = {json.dumps(str(fake_bazel))}
-target = "//ci/wheel:mypkg_wheel"
-""",
-        encoding="utf-8",
-    )
     monkeypatch.chdir(project_dir)
+
+    def configure(requires_python: str, dependency: str) -> None:
+        (project_dir / "pyproject.toml").write_text(
+            textwrap.dedent(f"""\
+                [build-system]
+                requires = ["bazel517"]
+                build-backend = "bazel517"
+
+                [project]
+                name = "mypkg"
+                version = "0.1.0"
+                requires-python = "{requires_python}"
+                dependencies = ["{dependency}"]
+
+                [tool.bazel517]
+                bazel-bin = "{fake_bazel}"
+                target = "//ci/wheel:mypkg_wheel"
+                """),
+            encoding="utf-8",
+        )
+
+    return configure
+
+
+def test_build_wheel_accepts_matching_static_project_metadata(
+    static_metadata_project: Callable[[str, str], None],
+    tmp_path: pathlib.Path,
+) -> None:
+    static_metadata_project(">=3.11", "packaging>=24")
     wheel_out = tmp_path / "wheels"
 
-    if conflicting_field is not None:
-        with pytest.raises(ValueError, match=conflicting_field):
-            bazel517.build_wheel(str(wheel_out))
-    else:
-        wheel_name = bazel517.build_wheel(str(wheel_out))
-        with zipfile.ZipFile(wheel_out / wheel_name) as wheel:
-            metadata = email.parser.BytesParser().parsebytes(
-                wheel.read("mypkg-0.1.0.dist-info/METADATA")
-            )
-        assert metadata["Requires-Python"] == requires_python
-        assert metadata.get_all("Requires-Dist") == [dependency]
+    wheel_name = bazel517.build_wheel(str(wheel_out))
+    with zipfile.ZipFile(wheel_out / wheel_name) as wheel:
+        metadata = email.parser.BytesParser().parsebytes(
+            wheel.read("mypkg-0.1.0.dist-info/METADATA")
+        )
+    assert metadata["Requires-Python"] == ">=3.11"
+    assert metadata.get_all("Requires-Dist") == ["packaging>=24"]
+
+
+@pytest.mark.parametrize(
+    "requires_python, dependency, conflicting_field",
+    [
+        pytest.param(
+            ">=99", "packaging>=24", "requires-python", id="conflicting-requires-python"
+        ),
+        pytest.param(
+            ">=3.11", "packaging>=999", "dependencies", id="conflicting-dependencies"
+        ),
+    ],
+)
+@pytest.mark.xfail(
+    raises=pytest.fail.Exception,
+    reason="GH #4: build_wheel accepts conflicting static project metadata",
+)
+def test_build_wheel_rejects_conflicting_static_project_metadata(
+    static_metadata_project: Callable[[str, str], None],
+    tmp_path: pathlib.Path,
+    requires_python: str,
+    dependency: str,
+    conflicting_field: str,
+) -> None:
+    static_metadata_project(requires_python, dependency)
+
+    with pytest.raises(ValueError, match=conflicting_field):
+        bazel517.build_wheel(str(tmp_path / "wheels"))
 
 
 def test_build_wheel_and_editable_as_installed(
