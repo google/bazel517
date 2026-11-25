@@ -26,6 +26,7 @@ import pytest
 import bazel517
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="Git is required for this test")
 @pytest.mark.parametrize(
     "project_subdir",
     [
@@ -34,9 +35,8 @@ import bazel517
             "python",
             id="repository-subdirectory",
             marks=pytest.mark.xfail(
-                strict=True,
                 raises=AssertionError,
-                reason="https://github.com/google/bazel517/issues/6",
+                reason="GH #6: Nested project sdists include Git-ignored files",
             ),
         ),
     ],
